@@ -1,7 +1,7 @@
 """
 Pharma Market Research Tool — Drug Indication Researcher
 =========================================================
-Takes a drug as input, uses the Claude AI API to intelligently:
+Takes a drug as input, uses the Google Gemini 2.5 Flash API to intelligently:
   • Identify the innovator company
   • Simulate SEC 10-K / annual report analysis
   • Extract all approved & pipeline indications
@@ -11,6 +11,7 @@ Usage:
     python drug_indication_researcher.py --drug "Keytruda"
     python drug_indication_researcher.py --drug "Ozempic" --output results.json
     python drug_indication_researcher.py --drug "Humira" --verbose
+    python drug_indication_researcher.py --drug "Paxlovid" --api-key YOUR_GEMINI_KEY
 """
 
 import os
@@ -33,62 +34,91 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+# ─────────────────────────────────────────────
+# Gemini 2.5 Flash Configuration
+# ─────────────────────────────────────────────
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
-# API key: set via --api-key CLI arg, ANTHROPIC_API_KEY env var, or ~/.anthropic_key file
+# API key: CLI --api-key  →  GOOGLE_API_KEY env var  →  GEMINI_API_KEY env var  →  ~/.gemini_key
 _API_KEY: Optional[str] = None
 
 
 def get_api_key() -> str:
-    """Resolve the Anthropic API key from multiple sources."""
+    """Resolve the Google Gemini API key from multiple sources."""
     global _API_KEY
     if _API_KEY:
         return _API_KEY
-    # 1. Environment variable (recommended)
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if key:
-        return key
-    # 2. ~/.anthropic_key file
-    key_file = os.path.expanduser("~/.anthropic_key")
+    for env_var in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
+        key = os.environ.get(env_var, "")
+        if key:
+            return key
+    key_file = os.path.expanduser("~/.gemini_key")
     if os.path.exists(key_file):
         with open(key_file) as f:
             key = f.read().strip()
         if key:
             return key
     raise ValueError(
-        "No Anthropic API key found. "
-        "Set ANTHROPIC_API_KEY env var or pass --api-key sk-ant-..."
+        "No Gemini API key found.\n"
+        "  Option 1: export GOOGLE_API_KEY='AIza...'\n"
+        "  Option 2: python drug_indication_researcher.py --drug X --api-key AIza...\n"
+        "  Option 3: echo 'AIza...' > ~/.gemini_key\n"
+        "Get a free key at https://aistudio.google.com/apikey"
     )
 
 
 # ─────────────────────────────────────────────
-# Claude API helper
+# Gemini API helpers
 # ─────────────────────────────────────────────
-def call_claude(system_prompt: str, user_message: str, max_tokens: int = 3000) -> str:
-    """Call the Anthropic Claude API and return the text response."""
-    headers = {
-        "Content-Type": "application/json",
-        "anthropic-version": "2023-06-01",
-        "x-api-key": get_api_key(),
-    }
+def call_gemini(system_prompt: str, user_message: str, max_tokens: int = 3000) -> str:
+    """
+    Call Google Gemini 2.5 Flash via the generateContent REST endpoint
+    and return the model's text response.
+    """
+    url = f"{GEMINI_API_BASE}/{GEMINI_MODEL}:generateContent?key={get_api_key()}"
     payload = {
-        "model": CLAUDE_MODEL,
-        "max_tokens": max_tokens,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": user_message}],
+        "system_instruction": {
+            "parts": [{"text": system_prompt}]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": user_message}]
+            }
+        ],
+        "generationConfig": {
+            "maxOutputTokens": max_tokens,
+            "temperature": 0.2,          # Low temp for factual/structured output
+            "responseMimeType": "text/plain",
+        },
     }
-    resp = requests.post(ANTHROPIC_API_URL, headers=headers, json=payload, timeout=60)
+    resp = requests.post(
+        url,
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=90,
+    )
     resp.raise_for_status()
     data = resp.json()
-    return data["content"][0]["text"]
+
+    # Extract text from Gemini response structure
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError) as e:
+        raise ValueError(f"Unexpected Gemini response structure: {data}") from e
 
 
-def call_claude_json(system_prompt: str, user_message: str, max_tokens: int = 3000) -> dict:
-    """Call Claude and parse JSON from the response."""
-    raw = call_claude(system_prompt, user_message, max_tokens)
-    # Strip markdown fences if present
-    clean = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+def call_gemini_json(system_prompt: str, user_message: str, max_tokens: int = 3000) -> dict:
+    """
+    Call Gemini 2.5 Flash and parse the JSON response.
+    Handles markdown code fences Gemini sometimes wraps around JSON.
+    """
+    raw = call_gemini(system_prompt, user_message, max_tokens)
+    # Strip ```json ... ``` or ``` ... ``` fences
+    clean = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
+    clean = re.sub(r"\s*```$", "", clean.strip())
+    clean = clean.strip()
     return json.loads(clean)
 
 
@@ -96,7 +126,7 @@ def call_claude_json(system_prompt: str, user_message: str, max_tokens: int = 30
 # Step 1 – Drug Resolution
 # ─────────────────────────────────────────────
 def resolve_drug_info(drug_name: str) -> dict:
-    """Use Claude to identify innovator, generic name, and company ticker."""
+    """Use Gemini 2.5 Flash to identify innovator, generic name, and company ticker."""
     logger.info(f"Resolving drug metadata for '{drug_name}' …")
 
     system = (
@@ -116,7 +146,7 @@ For the drug '{drug_name}', provide a JSON object with:
 Return ONLY the JSON object.
 """
     try:
-        info = call_claude_json(system, prompt)
+        info = call_gemini_json(system, prompt)
         info["input"] = drug_name
         logger.info(f"  → {info.get('brand_name')} ({info.get('generic_name')}) by {info.get('innovator_company')}")
         return info
@@ -138,7 +168,7 @@ Return ONLY the JSON object.
 # Step 2 – FDA Approved Indications
 # ─────────────────────────────────────────────
 def get_fda_approved_indications(drug_info: dict) -> dict:
-    """Use Claude to enumerate all FDA-approved indications as of its knowledge cutoff."""
+    """Use Gemini 2.5 Flash to enumerate all FDA-approved indications as of its knowledge cutoff."""
     logger.info("Extracting FDA-approved indications …")
 
     system = (
@@ -175,7 +205,7 @@ Return a JSON object:
 }}
 """
     try:
-        result = call_claude_json(system, prompt, max_tokens=4000)
+        result = call_gemini_json(system, prompt, max_tokens=4000)
         count = result.get("total_approved_indications", len(result.get("approved_indications", [])))
         logger.info(f"  FDA → {count} approved indication(s)")
         return result
@@ -254,7 +284,7 @@ Return a JSON object:
 }}
 """
     try:
-        result = call_claude_json(system, prompt, max_tokens=4000)
+        result = call_gemini_json(system, prompt, max_tokens=4000)
         approved_count = len(result.get("approved_indications_in_filings", []))
         pipeline_count = len(result.get("pipeline_indications", []))
         logger.info(f"  SEC/Annual Report → {approved_count} approved + {pipeline_count} pipeline indication(s)")
@@ -314,7 +344,7 @@ Return JSON:
 }}
 """
     try:
-        result = call_claude_json(system, prompt, max_tokens=2000)
+        result = call_gemini_json(system, prompt, max_tokens=2000)
         logger.info(f"  Global regulatory analysis complete")
         return result
     except Exception as e:
@@ -359,7 +389,7 @@ Provide a concise market research summary:
 }}
 """
     try:
-        result = call_claude_json(system, prompt, max_tokens=2000)
+        result = call_gemini_json(system, prompt, max_tokens=2000)
         logger.info("  Market context generated")
         return result
     except Exception as e:
@@ -428,7 +458,7 @@ def merge_all_indications(fda_data: dict, sec_data: dict) -> dict:
 # Step 7 – Therapeutic Area Categorization
 # ─────────────────────────────────────────────
 def categorize_by_therapeutic_area(merged: dict) -> dict:
-    """Use Claude to categorize all indications by therapeutic area."""
+    """Use Gemini 2.5 Flash to categorize all indications by therapeutic area."""
     logger.info("Categorizing by therapeutic area …")
 
     all_indications = merged.get("all_flat", [])
@@ -460,7 +490,7 @@ Return JSON:
 Only include TAs that have at least one indication.
 """
     try:
-        result = call_claude_json(system, prompt, max_tokens=2000)
+        result = call_gemini_json(system, prompt, max_tokens=2000)
         categorized = result.get("therapeutic_areas", {})
         logger.info(f"  Categorized into {len(categorized)} therapeutic area(s)")
         return categorized
@@ -521,7 +551,7 @@ def research_drug(drug_name: str, verbose: bool = False) -> dict:
             "first_approval_year": drug_info.get("first_approval_year"),
             "research_timestamp": datetime.now().isoformat(),
             "elapsed_seconds": round(elapsed, 2),
-            "model_used": CLAUDE_MODEL,
+            "model_used": GEMINI_MODEL,
         },
         "summary": {
             "total_approved_indications": len(merged["approved"]),
@@ -734,9 +764,9 @@ def print_report(report: dict):
                 print(f"  ⚠️  {r}")
 
     print("\n" + "=" * W)
-    print("  NOTE: Data sourced via AI analysis of publicly available FDA labels,")
-    print("  SEC 10-K/20-F filings, and company annual reports. Verify with")
-    print("  official sources for investment or regulatory decisions.")
+    print("  NOTE: Analysis powered by Gemini 2.5 Flash. Data sourced from publicly")
+    print("  available FDA labels, SEC 10-K/20-F filings, and annual reports. Verify")
+    print("  with official sources before investment or regulatory decisions.")
     print("=" * W + "\n")
 
 
@@ -745,7 +775,7 @@ def print_report(report: dict):
 # ─────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Pharma Market Research: Drug Indication Extractor via SEC/Annual Report Analysis",
+        description="Pharma Market Research: Drug Indication Extractor — powered by Gemini 2.5 Flash",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -764,14 +794,14 @@ Examples:
     parser.add_argument("--json-only", action="store_true",
                         help="Print only raw JSON (skip formatted report)")
     parser.add_argument("--api-key", default=None,
-                        help="Anthropic API key (overrides ANTHROPIC_API_KEY env var)")
+                        help="Google Gemini API key (overrides GOOGLE_API_KEY env var)")
 
     args = parser.parse_args()
 
     # Inject API key if provided via CLI
-    import drug_indication_researcher as _self
+    global _API_KEY
     if args.api_key:
-        _self._API_KEY = args.api_key
+        _API_KEY = args.api_key
 
     report = research_drug(args.drug, verbose=args.verbose)
 
