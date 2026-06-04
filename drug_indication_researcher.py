@@ -23,6 +23,10 @@ import logging
 from datetime import datetime
 from typing import Optional
 import requests
+from dotenv import load_dotenv
+
+# Load variables from .env file in the current directory (or parent directories)
+load_dotenv()
 
 # ─────────────────────────────────────────────
 # Logging
@@ -40,12 +44,20 @@ logger = logging.getLogger(__name__)
 GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
-# API key: CLI --api-key  →  GOOGLE_API_KEY env var  →  GEMINI_API_KEY env var  →  ~/.gemini_key
+# API key priority: --api-key CLI flag  →  .env file  →  shell environment
 _API_KEY: Optional[str] = None
 
 
 def get_api_key() -> str:
-    """Resolve the Google Gemini API key from multiple sources."""
+    """
+    Resolve the Google Gemini API key. Priority order:
+      1. --api-key CLI argument (passed at runtime)
+      2. GOOGLE_API_KEY or GEMINI_API_KEY defined in .env file
+      3. GOOGLE_API_KEY or GEMINI_API_KEY already exported in the shell
+
+    The .env file is loaded automatically at module import via load_dotenv(),
+    so its variables are merged into os.environ before this function is called.
+    """
     global _API_KEY
     if _API_KEY:
         return _API_KEY
@@ -53,18 +65,13 @@ def get_api_key() -> str:
         key = os.environ.get(env_var, "")
         if key:
             return key
-    key_file = os.path.expanduser("~/.gemini_key")
-    if os.path.exists(key_file):
-        with open(key_file) as f:
-            key = f.read().strip()
-        if key:
-            return key
     raise ValueError(
-        "No Gemini API key found.\n"
-        "  Option 1: export GOOGLE_API_KEY='AIza...'\n"
-        "  Option 2: python drug_indication_researcher.py --drug X --api-key AIza...\n"
-        "  Option 3: echo 'AIza...' > ~/.gemini_key\n"
-        "Get a free key at https://aistudio.google.com/apikey"
+        "No Gemini API key found.\n\n"
+        "Add your key to a .env file in the project directory:\n"
+        "  GOOGLE_API_KEY=AIza...\n\n"
+        "Or pass it directly at runtime:\n"
+        "  python drug_indication_researcher.py --drug Keytruda --api-key AIza...\n\n"
+        "Get a free key at: https://aistudio.google.com/apikey"
     )
 
 
@@ -794,7 +801,7 @@ Examples:
     parser.add_argument("--json-only", action="store_true",
                         help="Print only raw JSON (skip formatted report)")
     parser.add_argument("--api-key", default=None,
-                        help="Google Gemini API key (overrides GOOGLE_API_KEY env var)")
+                        help="Gemini API key (overrides .env / GOOGLE_API_KEY env var)")
 
     args = parser.parse_args()
 
