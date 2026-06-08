@@ -2,20 +2,20 @@
 Unified Drug Research Pipeline
 ===============================
 Runs all three modules and writes every result into a single Excel file,
-one sheet per module.
+one sheet per module, plus a combined sheet.
+
+All sheets use the SAME standardized column format:
+    molecule_name | company_name | indication | indication_type |
+    trial_title   | trial_id     | phase      | source_url      | data_source
+
+Indications are standardized (e.g. "Type 2 diabetes mellitus" → "T2DM",
+"overweight and obesity" → "Obesity") and classified as Primary or Secondary.
+
+Each row has exactly ONE indication (multi-indication trials are unnested).
 
 Usage:
     python run_all.py --molecule semaglutide
     python run_all.py --molecule semaglutide --sources pubmed,openalex
-
-Sheets produced:
-    1. Clinical Efficacy         ← label.py          (BigQuery + Gemini)
-    2. Drug Indication Research  ← drug_indication_researcher.py  (BigQuery + Gemini)
-    3. Literature                ← drug_literature_fetcher.py     (PubMed / PMC / … + Gemini)
-    4. Literature – Summary      ← summary sheet from drug_literature_fetcher
-
-Each indication is unnested: if a trial has multiple indications, each gets
-its own row.  Every sheet has auto-filters enabled.
 """
 
 import sys
@@ -30,6 +30,12 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
+
+from indication_standardizer import (
+    standardize_indication,
+    classify_indication,
+    process_indications,
+)
 
 # ── shared env ────────────────────────────────────────────────────────────────
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "").strip()
@@ -46,14 +52,22 @@ GEMINI_API_URL = (
     "gemini-2.5-flash:generateContent"
 )
 
-# ── openpyxl ──────────────────────────────────────────────────────────────────
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  BIGQUERY HELPERS  (shared by label + indication_researcher)
+#  COMMON FORMAT — all sheets share these columns
+# ══════════════════════════════════════════════════════════════════════════════
+
+HEADERS    = ["molecule_name", "company_name", "indication", "indication_type",
+              "trial_title", "trial_id", "phase", "source_url", "data_source"]
+COL_WIDTHS = [18, 22, 28, 16, 50, 18, 10, 40, 16]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BIGQUERY HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _bq_client():
@@ -94,21 +108,17 @@ def load_checkpoint(path: str) -> dict:
             return json.load(f)
     return {}
 
-
 def save_checkpoint(path: str, data: dict):
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  GEMINI ENRICHMENT  (clinical trials — used by label + indication_researcher)
+#  GEMINI ENRICHMENT (clinical trials)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _gemini_enrich_trials(rows: list[dict], molecule_name: str, checkpoint_prefix: str) -> list[dict]:
-    """
-    Calls Gemini to extract conditions + trial_title for each trial row.
-    Returns flat rows — one row per indication (unnested).
-    """
+def _gemini_enrich_trials(rows: list[dict], molecule_name: str,
+                          checkpoint_prefix: str, data_source_label: str) -> list[dict]:
     from google import genai
     from google.genai import types
 
@@ -119,7 +129,7 @@ def _gemini_enrich_trials(rows: list[dict], molecule_name: str, checkpoint_prefi
 
     print(f"  📁 Checkpoint: {len(cp)} completed rows\n")
 
-    enriched_raw = []
+    flat = []
     for i, row in enumerate(rows, 1):
         trial_id = row.get("trial_id")
         print(f"  [{i}/{total}] {trial_id}")
@@ -177,16 +187,25 @@ Rules:
                 trial_title = str(e)
                 print(f"     ❌ {e}")
 
-        enriched_raw.append({**row, "conditions": conditions, "trial_title": trial_title})
+        # ── Standardize + classify + unnest ──────────────────────────────
+        processed = process_indications(molecule_name, conditions)
+        if not processed:
+            processed = [{"indication": "No indication found", "indication_type": ""}]
 
-    # ── unnest: one row per indication ────────────────────────────────────────
-    flat = []
-    for row in enriched_raw:
-        conditions = row.pop("conditions")
-        for cond in conditions:
-            flat.append({**row, "condition": cond})
+        for ind in processed:
+            flat.append({
+                "molecule_name":   row.get("molecule_name"),
+                "company_name":    row.get("company_name"),
+                "indication":      ind["indication"],
+                "indication_type": ind["indication_type"],
+                "trial_title":     trial_title,
+                "trial_id":        trial_id,
+                "phase":           row.get("phase"),
+                "source_url":      row.get("source_url"),
+                "data_source":     data_source_label,
+            })
 
-    print(f"\n  ✅ Unnested → {len(flat)} rows (from {len(enriched_raw)} trials)\n")
+    print(f"\n  ✅ Unnested → {len(flat)} rows (from {total} trials)\n")
     return flat
 
 
@@ -200,7 +219,7 @@ def run_label(molecule: str) -> list[dict]:
     if not rows:
         print("  ❌ No data found in BigQuery")
         return []
-    return _gemini_enrich_trials(rows, molecule, "label")
+    return _gemini_enrich_trials(rows, molecule, "label", "Clinical Trials")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -213,11 +232,11 @@ def run_indication_researcher(molecule: str) -> list[dict]:
     if not rows:
         print("  ❌ No data found in BigQuery")
         return []
-    return _gemini_enrich_trials(rows, molecule, "indication")
+    return _gemini_enrich_trials(rows, molecule, "indication", "Innovator Research")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MODULE C — drug_literature_fetcher.py  (literature sources)
+#  MODULE C — drug_literature_fetcher.py
 # ══════════════════════════════════════════════════════════════════════════════
 
 DEFAULT_MAX = 50
@@ -361,8 +380,7 @@ def fetch_openalex(drug: str, max_results: int = DEFAULT_MAX) -> list[dict]:
         articles, page, per_page = [], 1, min(max_results, 50)
         while len(articles) < max_results:
             r = requests.get(BASE, params={
-                "search": drug,
-                "filter": "has_abstract:true",
+                "search": drug, "filter": "has_abstract:true",
                 "per-page": per_page, "page": page,
                 "select": "id,title,abstract_inverted_index,primary_location,doi",
             }, headers={"User-Agent": "DrugLitFetcher/2.0 (research tool)"}, timeout=20)
@@ -509,8 +527,7 @@ SOURCES = {
 }
 
 
-def run_literature(drug: str, sources_arg: str = "all") -> tuple[list[dict], dict]:
-    """Returns (flat_rows, source_stats). Each row has one indication per row (unnested)."""
+def run_literature(drug: str, sources_arg: str = "all") -> list[dict]:
     print("\n━━━ [3/3] Drug Literature Fetcher ━━━")
 
     if sources_arg.lower() == "all":
@@ -537,86 +554,74 @@ def run_literature(drug: str, sources_arg: str = "all") -> tuple[list[dict], dic
     flat = []
     for i, article in enumerate(all_articles, 1):
         print(f"    [{i:>3}/{len(all_articles)}] [{article['source']}] {article['title'][:60]}")
-        inds = extract_indications_lit(drug, article["title"], article["abstract"])
+        raw_inds = extract_indications_lit(drug, article["title"], article["abstract"])
         time.sleep(0.2)
-        base = {
-            "drug":     drug.title(),
-            "source":   article["source"],
-            "title":    article["title"],
-            "journal":  article["journal"],
-            "link":     article["link"],
-            "abstract": article["abstract"],
-        }
-        if inds:
-            for ind in inds:          # ← unnest: one row per indication
-                flat.append({**base, "indication": ind})
-        else:
-            flat.append({**base, "indication": "No indication found"})
+
+        processed = process_indications(drug, raw_inds)
+        if not processed:
+            processed = [{"indication": "No indication found", "indication_type": ""}]
+
+        for ind in processed:
+            flat.append({
+                "molecule_name":   drug.title(),
+                "company_name":    article["source"],
+                "indication":      ind["indication"],
+                "indication_type": ind["indication_type"],
+                "trial_title":     article["title"],
+                "trial_id":        "",
+                "phase":           "",
+                "source_url":      article["link"],
+                "data_source":     "Literature",
+            })
 
     print(f"\n  ✅ Literature rows: {len(flat)}\n")
-    return flat, source_stats
+    return flat
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  EXCEL WRITER — all sheets in one workbook
+#  EXCEL WRITER — common format for all sheets
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _thin_border():
-    return Border(
-        bottom=Side(style="thin", color="DDDDDD"),
-        right=Side(style="thin",  color="DDDDDD"),
-    )
+    return Border(bottom=Side(style="thin", color="DDDDDD"),
+                  right=Side(style="thin", color="DDDDDD"))
 
 
-def _header_row(ws, headers: list[str], row_num: int = 1,
-                bg: str = "1A1A2E", fg: str = "FFFFFF"):
-    thin    = _thin_border()
-    hfill   = PatternFill("solid", start_color=bg)
-    for col, h in enumerate(headers, 1):
-        c           = ws.cell(row=row_num, column=col, value=h)
-        c.font      = Font(name="Arial", bold=True, color=fg, size=10)
-        c.fill      = hfill
-        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        c.border    = thin
-    ws.row_dimensions[row_num].height = 22
+def _write_standard_sheet(ws, rows: list[dict], molecule: str, sheet_title: str):
+    thin     = _thin_border()
+    hfill    = PatternFill("solid", start_color="1A1A2E")
+    alt_fill = PatternFill("solid", start_color="F4F7FB")
+    ncols    = len(HEADERS)
 
-
-def _set_col_widths(ws, widths: list[int]):
-    for i, w in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-
-
-def _title_meta(ws, title: str, subtitle: str, ncols: int):
+    # Title row
     ws.merge_cells(f"A1:{get_column_letter(ncols)}1")
     c           = ws["A1"]
-    c.value     = title
+    c.value     = f"{sheet_title}  —  {molecule.title()}"
     c.font      = Font(name="Arial", bold=True, size=14, color="1A1A2E")
     c.alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[1].height = 32
 
+    # Subtitle row
     ws.merge_cells(f"A2:{get_column_letter(ncols)}2")
     c           = ws["A2"]
-    c.value     = subtitle
+    c.value     = f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}   |   Rows: {len(rows)}"
     c.font      = Font(name="Arial", italic=True, size=9, color="888888")
     c.alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[2].height = 16
 
+    # Header row
+    for col, h in enumerate(HEADERS, 1):
+        c           = ws.cell(row=3, column=col, value=h)
+        c.font      = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+        c.fill      = hfill
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border    = thin
+    ws.row_dimensions[3].height = 22
 
-def write_clinical_sheet(ws, rows: list[dict], molecule: str, sheet_title: str,
-                          headers: list[str], col_keys: list[str], col_widths: list[int]):
-    """Generic writer for both label + indication_researcher sheets."""
-    thin     = _thin_border()
-    alt_fill = PatternFill("solid", start_color="F4F7FB")
-    ncols    = len(headers)
-
-    _title_meta(ws, f"{sheet_title}  —  {molecule.title()}",
-                f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}   |   Rows: {len(rows)}",
-                ncols)
-    _header_row(ws, headers, row_num=3)
-
+    # Data rows
     for idx, row in enumerate(rows, start=4):
         fill = alt_fill if idx % 2 == 0 else None
-        for col, key in enumerate(col_keys, 1):
+        for col, key in enumerate(HEADERS, 1):
             c           = ws.cell(row=idx, column=col, value=row.get(key, ""))
             c.font      = Font(name="Arial", size=9)
             c.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
@@ -625,99 +630,10 @@ def write_clinical_sheet(ws, rows: list[dict], molecule: str, sheet_title: str,
                 c.fill = fill
         ws.row_dimensions[idx].height = 18
 
-    ws.auto_filter.ref = (
-        f"A3:{get_column_letter(ncols)}{3 + len(rows)}"
-    )
-    ws.freeze_panes = "A4"
-    _set_col_widths(ws, col_widths)
-
-
-def write_literature_sheet(ws, rows: list[dict], drug: str, source_stats: dict):
-    thin     = _thin_border()
-    alt_fill = PatternFill("solid", start_color="F4F7FB")
-    ncols    = 6
-
-    _title_meta(ws, f"Drug Literature  —  {drug.title()}",
-                f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}   |   "
-                f"Rows: {len(rows)}   |   "
-                f"Sources: {', '.join(f'{s} ({n})' for s, n in source_stats.items() if n)}",
-                ncols)
-
-    headers = ["Drug", "Source", "Title / Journal", "Link", "Indication", "Abstract (excerpt)"]
-    _header_row(ws, headers, row_num=3)
-
-    for idx, row in enumerate(rows, start=4):
-        fill      = alt_fill if idx % 2 == 0 else None
-        src_color = SOURCE_COLORS.get(row["source"], "333333")
-
-        def _c(col, val, bold=False, color="111111", link=None):
-            cell           = ws.cell(row=idx, column=col, value=val)
-            cell.font      = Font(name="Arial", size=9, bold=bold, color=color,
-                                  underline="single" if link else None)
-            cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
-            cell.border    = thin
-            if fill:
-                cell.fill = fill
-            if link:
-                cell.hyperlink = link
-            return cell
-
-        _c(1, row["drug"])
-        _c(2, row["source"], bold=True, color=src_color)
-        _c(3, f"{row['title']}\n{row['journal']}")
-        _c(4, row["link"], color="1A73E8", link=row["link"])
-        _c(5, row["indication"])
-        excerpt = row["abstract"][:300] + "…" if len(row["abstract"]) > 300 else row["abstract"]
-        _c(6, excerpt)
-        ws.row_dimensions[idx].height = 36
-
     ws.auto_filter.ref = f"A3:{get_column_letter(ncols)}{3 + len(rows)}"
-    ws.freeze_panes    = "A4"
-    for col, w in zip(range(1, 7), [10, 16, 44, 34, 32, 52]):
-        ws.column_dimensions[get_column_letter(col)].width = w
-
-
-def write_literature_summary_sheet(ws, rows: list[dict], source_stats: dict):
-    thin  = _thin_border()
-    hfill = PatternFill("solid", start_color="1A1A2E")
-    alt   = PatternFill("solid", start_color="F4F7FB")
-
-    ws["A1"].value = "Literature Summary by Source"
-    ws["A1"].font  = Font(name="Arial", bold=True, size=13, color="1A1A2E")
-    ws.row_dimensions[1].height = 28
-
-    headers = ["Source", "Articles Fetched", "With Indications", "Unique Indications"]
-    for col, h in enumerate(headers, 1):
-        c           = ws.cell(row=2, column=col, value=h)
-        c.font      = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-        c.fill      = hfill
-        c.alignment = Alignment(horizontal="center")
-        c.border    = thin
-
-    agg = {}
-    for row in rows:
-        s = row["source"]
-        agg.setdefault(s, {"total": 0, "with_ind": 0, "indications": set()})
-        agg[s]["total"] += 1
-        ind = row["indication"].strip()
-        if ind and ind != "No indication found":
-            agg[s]["with_ind"] += 1
-            agg[s]["indications"].add(ind)
-
-    for i, (src, data) in enumerate(agg.items(), start=3):
-        fill  = alt if i % 2 == 0 else None
-        color = SOURCE_COLORS.get(src, "333333")
-        for col, val in enumerate([src, data["total"], data["with_ind"], len(data["indications"])], 1):
-            c           = ws.cell(row=i, column=col, value=val)
-            c.font      = Font(name="Arial", size=10, bold=(col == 1),
-                               color=color if col == 1 else "000000")
-            c.alignment = Alignment(horizontal="center" if col > 1 else "left")
-            c.border    = thin
-            if fill:
-                c.fill = fill
-
-    for col, w in zip(range(1, 5), [22, 18, 20, 20]):
-        ws.column_dimensions[get_column_letter(col)].width = w
+    ws.freeze_panes = "A4"
+    for i, w in enumerate(COL_WIDTHS, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
 
 
 # ── utility ───────────────────────────────────────────────────────────────────
@@ -725,7 +641,6 @@ def write_literature_summary_sheet(ws, rows: list[dict], source_stats: dict):
 def _rx(pattern, text, flags=0):
     m = re.search(pattern, text, flags)
     return m.group(1).strip() if m else ""
-
 
 def _strip_tags(text):
     return re.sub(r"<[^>]+>", "", text).strip()
@@ -755,50 +670,40 @@ def main():
         sys.exit("❌  GEMINI_API_KEY not set in .env")
 
     # ── run all modules ───────────────────────────────────────────────────────
-    label_rows       = run_label(molecule)
-    indication_rows  = run_indication_researcher(molecule)
-    lit_rows, source_stats = run_literature(molecule, args.sources)
+    label_rows      = run_label(molecule)
+    indication_rows = run_indication_researcher(molecule)
+    lit_rows        = run_literature(molecule, args.sources)
 
     # ── assemble workbook ─────────────────────────────────────────────────────
     print(f"\n📊 Writing {out_file}…")
     wb = openpyxl.Workbook()
 
-    # Sheet 1 — Clinical Efficacy (label.py)
+    # Sheet 1 — Clinical Efficacy
     ws1       = wb.active
     ws1.title = "Clinical Efficacy"
-    write_clinical_sheet(
-        ws1, label_rows, molecule,
-        "Clinical Efficacy",
-        headers   = ["molecule_name", "condition", "trial_title", "trial_id", "phase"],
-        col_keys  = ["molecule_name", "condition", "trial_title", "trial_id", "phase"],
-        col_widths= [18, 28, 50, 18, 10],
-    )
+    _write_standard_sheet(ws1, label_rows, molecule, "Clinical Efficacy")
 
     # Sheet 2 — Drug Indication Research
     ws2       = wb.create_sheet("Drug Indication Research")
-    write_clinical_sheet(
-        ws2, indication_rows, molecule,
-        "Drug Indication Research",
-        headers   = ["molecule_name", "company_name", "condition", "trial_title", "trial_id", "phase"],
-        col_keys  = ["molecule_name", "company_name", "condition", "trial_title", "trial_id", "phase"],
-        col_widths= [18, 22, 28, 50, 18, 10],
-    )
+    _write_standard_sheet(ws2, indication_rows, molecule, "Drug Indication Research")
 
     # Sheet 3 — Literature
     ws3       = wb.create_sheet("Literature")
-    write_literature_sheet(ws3, lit_rows, molecule, source_stats)
+    _write_standard_sheet(ws3, lit_rows, molecule, "Drug Literature")
 
-    # Sheet 4 — Literature Summary
-    ws4       = wb.create_sheet("Literature Summary")
-    write_literature_summary_sheet(ws4, lit_rows, source_stats)
+    # Sheet 4 — Combined (all three merged)
+    combined  = label_rows + indication_rows + lit_rows
+    ws4       = wb.create_sheet("All Combined")
+    _write_standard_sheet(ws4, combined, molecule, "All Sources Combined")
 
     wb.save(out_file)
 
     print(f"\n✅  Done!")
     print(f"📄  File   : {out_file}")
-    print(f"📊  Sheets : Clinical Efficacy ({len(label_rows)} rows) | "
-          f"Drug Indication Research ({len(indication_rows)} rows) | "
-          f"Literature ({len(lit_rows)} rows)")
+    print(f"📊  Sheets : Clinical Efficacy ({len(label_rows)}) | "
+          f"Drug Indication Research ({len(indication_rows)}) | "
+          f"Literature ({len(lit_rows)}) | "
+          f"All Combined ({len(combined)})")
 
 
 if __name__ == "__main__":
