@@ -325,6 +325,129 @@ PRIMARY_INDICATIONS: dict[str, set[str]] = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  THERAPY AREA MAP
+#  standardized indication → broad therapeutic area
+# ══════════════════════════════════════════════════════════════════════════════
+
+THERAPY_AREA: dict[str, str] = {
+    # ── Endocrinology / Metabolic ─────────────────────────────────────────────
+    "T2DM":                     "Metabolic",
+    "T1DM":                     "Metabolic",
+    "Gestational Diabetes":     "Metabolic",
+    "Diabetes Mellitus":        "Metabolic",
+    "Obesity":                  "Metabolic",
+    "Metabolic Syndrome":       "Metabolic",
+    "Dyslipidemia":             "Metabolic",
+    "Hypercholesterolemia":     "Metabolic",
+    "Hypertriglyceridemia":     "Metabolic",
+    "Gout":                     "Metabolic",
+    "Hyperuricemia":            "Metabolic",
+    "PCOS":                     "Metabolic",
+
+    # ── Cardiovascular ────────────────────────────────────────────────────────
+    "Heart Failure":            "Cardiovascular",
+    "HFpEF":                    "Cardiovascular",
+    "HFrEF":                    "Cardiovascular",
+    "MACE Reduction":           "Cardiovascular",
+    "CV Risk Reduction":        "Cardiovascular",
+    "Cardiovascular Disease":   "Cardiovascular",
+    "ASCVD":                    "Cardiovascular",
+    "Peripheral Artery Disease":"Cardiovascular",
+    "Coronary Artery Disease":  "Cardiovascular",
+    "Atrial Fibrillation":      "Cardiovascular",
+    "Hypertension":             "Cardiovascular",
+    "Pulmonary Arterial Hypertension": "Cardiovascular",
+    "Myocardial Infarction":    "Cardiovascular",
+    "Stroke Prevention":        "Cardiovascular",
+    "Stroke":                   "Cardiovascular",
+
+    # ── Hepatology ────────────────────────────────────────────────────────────
+    "NASH":                     "Hepatology",
+    "MASH":                     "Hepatology",
+    "NAFLD":                    "Hepatology",
+    "MAFLD":                    "Hepatology",
+    "Hepatitis B":              "Hepatology",
+    "Hepatitis C":              "Hepatology",
+    "HCC":                      "Oncology",  # liver cancer → oncology
+
+    # ── Nephrology ────────────────────────────────────────────────────────────
+    "CKD":                      "Nephrology",
+    "ESRD":                     "Nephrology",
+    "Acute Kidney Injury":      "Nephrology",
+    "Diabetic Kidney Disease":  "Nephrology",
+
+    # ── Respiratory ───────────────────────────────────────────────────────────
+    "COPD":                     "Respiratory",
+    "Asthma":                   "Respiratory",
+    "OSA":                      "Respiratory",
+    "IPF":                      "Respiratory",
+
+    # ── Neuroscience ──────────────────────────────────────────────────────────
+    "Alzheimer's Disease":      "Neuroscience",
+    "Parkinson's Disease":      "Neuroscience",
+    "MDD":                      "Neuroscience",
+    "Depression":               "Neuroscience",
+    "Multiple Sclerosis":       "Neuroscience",
+    "Epilepsy":                 "Neuroscience",
+    "Migraine":                 "Neuroscience",
+    "Schizophrenia":            "Neuroscience",
+    "Bipolar Disorder":         "Neuroscience",
+    "ADHD":                     "Neuroscience",
+    "Substance Use Disorder":   "Neuroscience",
+    "Alcohol Use Disorder":     "Neuroscience",
+    "Opioid Use Disorder":      "Neuroscience",
+    "Addiction":                "Neuroscience",
+
+    # ── Oncology ──────────────────────────────────────────────────────────────
+    "NSCLC":                    "Oncology",
+    "SCLC":                     "Oncology",
+    "RCC":                      "Oncology",
+    "Breast Cancer":            "Oncology",
+    "Prostate Cancer":          "Oncology",
+    "Colorectal Cancer":        "Oncology",
+    "Pancreatic Cancer":        "Oncology",
+    "Ovarian Cancer":           "Oncology",
+    "Bladder Cancer":           "Oncology",
+    "Gastric Cancer":           "Oncology",
+    "Melanoma":                 "Oncology",
+    "Leukemia":                 "Oncology",
+    "Lymphoma":                 "Oncology",
+    "Myeloma":                  "Oncology",
+    "Glioblastoma":             "Oncology",
+
+    # ── Immunology ────────────────────────────────────────────────────────────
+    "Rheumatoid Arthritis":     "Immunology",
+    "Osteoarthritis":           "Musculoskeletal",
+    "Psoriatic Arthritis":      "Immunology",
+    "Ankylosing Spondylitis":   "Immunology",
+    "SLE":                      "Immunology",
+    "Crohn's Disease":          "Immunology",
+    "Ulcerative Colitis":       "Immunology",
+    "IBD":                      "Immunology",
+    "IBS":                      "Gastroenterology",
+    "Psoriasis":                "Immunology",
+    "Atopic Dermatitis":        "Immunology",
+
+    # ── Musculoskeletal ───────────────────────────────────────────────────────
+    "Osteoporosis":             "Musculoskeletal",
+
+    # ── Infectious Disease ────────────────────────────────────────────────────
+    "HIV":                      "Infectious Disease",
+    "Tuberculosis":             "Infectious Disease",
+
+    # ── Ophthalmology ─────────────────────────────────────────────────────────
+    "AMD":                      "Ophthalmology",
+    "DME":                      "Ophthalmology",
+    "Glaucoma":                 "Ophthalmology",
+    "Diabetic Retinopathy":     "Ophthalmology",
+
+    # ── Diabetic complications ────────────────────────────────────────────────
+    "Diabetic Neuropathy":      "Neuroscience",
+    "Diabetic Foot Ulcer":      "Metabolic",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  PUBLIC API
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -340,6 +463,11 @@ def standardize_indication(raw: str) -> str:
     return text.title()
 
 
+def get_therapy_area(indication: str) -> str:
+    """Return the therapy area for a standardized indication."""
+    return THERAPY_AREA.get(indication, "Other")
+
+
 def classify_indication(drug: str, indication: str) -> str:
     """Return 'Primary' or 'Secondary' for a given drug + standardized indication."""
     drug_lower = drug.strip().lower()
@@ -353,10 +481,10 @@ def classify_indication(drug: str, indication: str) -> str:
 def process_indications(drug: str, raw_indications: list[str]) -> list[dict]:
     """
     Take a list of raw indication strings, standardize, deduplicate,
-    and classify each as Primary/Secondary.
+    and classify each as Primary/Secondary with therapy area.
 
     Returns a list of dicts:
-        [{"indication": "T2DM", "indication_type": "Primary"}, ...]
+        [{"indication": "T2DM", "indication_type": "Primary", "therapy_area": "Metabolic"}, ...]
     """
     seen = set()
     results = []
@@ -370,5 +498,6 @@ def process_indications(drug: str, raw_indications: list[str]) -> list[dict]:
         results.append({
             "indication": std,
             "indication_type": classify_indication(drug, std),
+            "therapy_area": get_therapy_area(std),
         })
     return results
