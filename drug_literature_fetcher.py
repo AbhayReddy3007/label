@@ -362,8 +362,8 @@ SOURCES = {
 # ══════════════════════════════════════════════════════════════════════════════
 
 HEADERS    = ["molecule_name", "company_name", "indication", "indication_type",
-              "trial_title", "trial_id", "phase", "source_url", "data_source"]
-COL_WIDTHS = [18, 22, 28, 16, 50, 18, 10, 40, 16]
+              "therapy_area", "trial_title", "trial_id", "phase", "source_url", "data_source"]
+COL_WIDTHS = [18, 22, 28, 16, 18, 50, 18, 10, 40, 16]
 
 
 def _thin_border():
@@ -486,6 +486,7 @@ def main():
                 "company_name":    article["source"],   # literature source as "company"
                 "indication":      ind["indication"],
                 "indication_type": ind["indication_type"],
+                "therapy_area":    ind["therapy_area"],
                 "trial_title":     article["title"],
                 "trial_id":        "",                   # no trial_id for literature
                 "phase":           "",                   # no phase for literature
