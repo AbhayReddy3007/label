@@ -34,6 +34,7 @@ load_dotenv(override=True)
 from indication_standardizer import (
     standardize_indication,
     classify_indication,
+    get_therapy_area,
     process_indications,
 )
 
@@ -62,8 +63,8 @@ from openpyxl.utils import get_column_letter
 # ══════════════════════════════════════════════════════════════════════════════
 
 HEADERS    = ["molecule_name", "company_name", "indication", "indication_type",
-              "trial_title", "trial_id", "phase", "source_url", "data_source"]
-COL_WIDTHS = [18, 22, 28, 16, 50, 18, 10, 40, 16]
+              "therapy_area", "trial_title", "trial_id", "phase", "source_url", "data_source"]
+COL_WIDTHS = [18, 22, 28, 16, 18, 50, 18, 10, 40, 16]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -190,7 +191,7 @@ Rules:
         # ── Standardize + classify + unnest ──────────────────────────────
         processed = process_indications(molecule_name, conditions)
         if not processed:
-            processed = [{"indication": "No indication found", "indication_type": ""}]
+            processed = [{"indication": "No indication found", "indication_type": "", "therapy_area": ""}]
 
         for ind in processed:
             flat.append({
@@ -198,6 +199,7 @@ Rules:
                 "company_name":    row.get("company_name"),
                 "indication":      ind["indication"],
                 "indication_type": ind["indication_type"],
+                "therapy_area":    ind.get("therapy_area", ""),
                 "trial_title":     trial_title,
                 "trial_id":        trial_id,
                 "phase":           row.get("phase"),
@@ -363,6 +365,7 @@ def _innovator_research(molecule: str, company: str) -> list[dict]:
                     "company_name":    company,
                     "indication":      std,
                     "indication_type": classify_indication(molecule, std),
+                    "therapy_area":    get_therapy_area(std),
                     "trial_title":     e.get("source_document", ""),
                     "trial_id":        e.get("brand_name", ""),
                     "phase":           e.get("phase", ""),
@@ -718,7 +721,7 @@ def run_literature(drug: str, sources_arg: str = "all") -> list[dict]:
 
         processed = process_indications(drug, raw_inds)
         if not processed:
-            processed = [{"indication": "No indication found", "indication_type": ""}]
+            processed = [{"indication": "No indication found", "indication_type": "", "therapy_area": ""}]
 
         for ind in processed:
             flat.append({
@@ -726,6 +729,7 @@ def run_literature(drug: str, sources_arg: str = "all") -> list[dict]:
                 "company_name":    article["source"],
                 "indication":      ind["indication"],
                 "indication_type": ind["indication_type"],
+                "therapy_area":    ind.get("therapy_area", ""),
                 "trial_title":     article["title"],
                 "trial_id":        "",
                 "phase":           "",
