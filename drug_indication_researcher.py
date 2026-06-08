@@ -33,7 +33,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-from indication_standardizer import standardize_indication, classify_indication, process_indications
+from indication_standardizer import standardize_indication, classify_indication, get_therapy_area, process_indications
 
 load_dotenv(override=True)
 
@@ -251,6 +251,7 @@ def research_indications(molecule: str, company: str) -> list[dict]:
                     "company_name":    company,
                     "indication":      std_indication,
                     "indication_type": ind_type,
+                    "therapy_area":    get_therapy_area(std_indication),
                     "trial_title":     e.get("source_document", ""),
                     "trial_id":        e.get("brand_name", ""),
                     "phase":           e.get("phase", ""),
@@ -309,6 +310,7 @@ def _fallback_extract(molecule, company, source_type, raw_text, all_rows):
                     "company_name":    company,
                     "indication":      std,
                     "indication_type": classify_indication(molecule, std),
+                    "therapy_area":    get_therapy_area(std),
                     "trial_title":     "(extracted from unstructured response)",
                     "trial_id":        "",
                     "phase":           "",
@@ -325,8 +327,8 @@ def _fallback_extract(molecule, company, source_type, raw_text, all_rows):
 # ══════════════════════════════════════════════════════════════════════════════
 
 HEADERS    = ["molecule_name", "company_name", "indication", "indication_type",
-              "trial_title", "trial_id", "phase", "source_url", "data_source"]
-COL_WIDTHS = [18, 22, 28, 16, 50, 18, 10, 40, 16]
+              "therapy_area", "trial_title", "trial_id", "phase", "source_url", "data_source"]
+COL_WIDTHS = [18, 22, 28, 16, 18, 50, 18, 10, 40, 16]
 
 
 def _thin_border():
