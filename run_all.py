@@ -223,16 +223,175 @@ def run_label(molecule: str) -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MODULE B — drug_indication_researcher.py
+#  MODULE B — drug_indication_researcher.py  (Gemini + Google Search, NO BigQuery)
+#
+#  Searches innovator/investor sources: FDA labels, investor presentations,
+#  press releases, pipeline pages. Each row = one indication × one source doc.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_indication_researcher(molecule: str) -> list[dict]:
-    print("\n━━━ [2/3] Drug Indication Research ━━━")
-    rows = fetch_bq_rows(molecule)
-    if not rows:
-        print("  ❌ No data found in BigQuery")
-        return []
-    return _gemini_enrich_trials(rows, molecule, "indication", "Innovator Research")
+def _identify_company(molecule: str) -> str:
+    from google import genai as _genai
+    from google.genai import types as _types
+    client = _genai.Client(api_key=GEMINI_API_KEY)
+    try:
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=(
+                f"Who is the innovator pharmaceutical company that developed {molecule}? "
+                f"Return ONLY JSON: {{\"company\": \"<name>\", \"brand_names\": [\"name1\"]}}"
+            ),
+            config=_types.GenerateContentConfig(
+                temperature=0,
+                tools=[_types.Tool(google_search=_types.GoogleSearch())],
+                system_instruction="Return ONLY valid JSON. No markdown.",
+            ),
+        )
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp.text.strip()).strip()
+        data = json.loads(text)
+        company = data.get("company", "")
+        print(f"  🏢 Auto-detected innovator: {company}")
+        return company
+    except Exception:
+        return ""
+
+
+def _build_innovator_queries(molecule: str, company: str) -> list[dict]:
+    return [
+        {
+            "source_type": "Regulatory Label",
+            "prompt": (
+                f"Search for official FDA prescribing information and EMA SmPC for {molecule} (by {company}).\n"
+                f"For EACH approved indication, return a separate entry.\n\n"
+                f"Return ONLY valid JSON:\n"
+                f'{{"entries": [\n'
+                f'  {{"indication": "...", "brand_name": "...", "source_document": "<exact label title>", '
+                f'"phase": "Approved", "source_url": "...", "detail": "<approval year, population>"}}\n'
+                f"]}}\n"
+                f"source_document must be the REAL document title. No explanation, only JSON."
+            ),
+        },
+        {
+            "source_type": "Investor Presentation",
+            "prompt": (
+                f"Search for {company}'s latest investor presentations, Capital Markets Day slides, "
+                f"R&D day presentations about {molecule}.\n"
+                f"For EACH indication mentioned, return a separate entry.\n\n"
+                f"Return ONLY valid JSON:\n"
+                f'{{"entries": [\n'
+                f'  {{"indication": "...", "brand_name": "...", '
+                f'"source_document": "<real presentation title with year>", '
+                f'"phase": "<Phase 1/2/3/Filed/Approved/Launched>", '
+                f'"source_url": "...", "detail": "<specific claim from the presentation>"}}\n'
+                f"]}}\n"
+                f"source_document must be the REAL title. No explanation, only JSON."
+            ),
+        },
+        {
+            "source_type": "Press Release",
+            "prompt": (
+                f"Search for press releases and earnings call statements from {company} about {molecule}.\n"
+                f"For EACH indication mentioned, return a separate entry.\n\n"
+                f"Return ONLY valid JSON:\n"
+                f'{{"entries": [\n'
+                f'  {{"indication": "...", "brand_name": "...", '
+                f'"source_document": "<real press release headline or earnings call date>", '
+                f'"phase": "<Phase 1/2/3/Filed/Approved>", '
+                f'"source_url": "...", "detail": "<key announcement>"}}\n'
+                f"]}}\n"
+                f"source_document must be the REAL headline. No explanation, only JSON."
+            ),
+        },
+        {
+            "source_type": "Pipeline Page",
+            "prompt": (
+                f"Search for {company}'s official pipeline page listing {molecule}.\n"
+                f"For EACH indication on the pipeline, return a separate entry.\n\n"
+                f"Return ONLY valid JSON:\n"
+                f'{{"entries": [\n'
+                f'  {{"indication": "...", "brand_name": "...", '
+                f'"source_document": "<e.g. {company} Pipeline — Q1 2025>", '
+                f'"phase": "<Preclinical/Phase 1/2/3/Filed/Approved>", '
+                f'"source_url": "...", "detail": "<status note>"}}\n'
+                f"]}}\n"
+                f"phase MUST be filled. No explanation, only JSON."
+            ),
+        },
+    ]
+
+
+def _innovator_research(molecule: str, company: str) -> list[dict]:
+    from google import genai as _genai
+    from google.genai import types as _types
+
+    client   = _genai.Client(api_key=GEMINI_API_KEY)
+    queries  = _build_innovator_queries(molecule, company)
+    all_rows = []
+
+    for q in queries:
+        source_type = q["source_type"]
+        print(f"\n  🔍 {source_type}…")
+        try:
+            resp = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=q["prompt"],
+                config=_types.GenerateContentConfig(
+                    temperature=0,
+                    tools=[_types.Tool(google_search=_types.GoogleSearch())],
+                    system_instruction=(
+                        "You are a pharmaceutical analyst researching what the "
+                        "innovator company publicly says about this drug. "
+                        "Search the web. Return ONLY valid JSON."
+                    ),
+                ),
+            )
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp.text.strip()).strip()
+            entries = json.loads(text).get("entries", [])
+            if not entries:
+                print(f"     ⚠️  No entries")
+                continue
+            print(f"     ✅ {len(entries)} entries")
+
+            for e in entries:
+                raw = e.get("indication", "").strip()
+                if not raw:
+                    continue
+                std = standardize_indication(raw)
+                if std.lower() in ("error", "n/a", "none", "no indication found"):
+                    continue
+                all_rows.append({
+                    "molecule_name":   molecule.title(),
+                    "company_name":    company,
+                    "indication":      std,
+                    "indication_type": classify_indication(molecule, std),
+                    "trial_title":     e.get("source_document", ""),
+                    "trial_id":        e.get("brand_name", ""),
+                    "phase":           e.get("phase", ""),
+                    "source_url":      e.get("source_url", ""),
+                    "data_source":     f"Innovator: {source_type}",
+                })
+        except json.JSONDecodeError:
+            print(f"     ⚠️  JSON parse failed")
+        except Exception as ex:
+            print(f"     ❌ {ex}")
+
+    # dedup only exact same indication + same source doc
+    seen, unique = set(), []
+    for row in all_rows:
+        key = (row["indication"], row["trial_title"], row["data_source"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(row)
+
+    print(f"\n  📊 Innovator rows: {len(unique)} (deduped from {len(all_rows)})\n")
+    return unique
+
+
+def run_indication_researcher(molecule: str, company: str | None = None) -> list[dict]:
+    print("\n━━━ [2/3] Drug Indication Research (Innovator Sources) ━━━")
+    if not company:
+        print("  🔎 Identifying innovator company…")
+        company = _identify_company(molecule) or ""
+    return _innovator_research(molecule, company)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -653,6 +812,8 @@ def _strip_tags(text):
 def main():
     parser = argparse.ArgumentParser(description="Unified drug research pipeline → single Excel")
     parser.add_argument("--molecule", required=True, help="Drug/molecule name, e.g. semaglutide")
+    parser.add_argument("--company",  default=None,
+                        help="Innovator company name, e.g. 'Novo Nordisk' (improves innovator search)")
     parser.add_argument("--sources",  default="all",
                         help=f"Literature sources (default: all). Options: {', '.join(SOURCES)}")
     args = parser.parse_args()
@@ -671,7 +832,7 @@ def main():
 
     # ── run all modules ───────────────────────────────────────────────────────
     label_rows      = run_label(molecule)
-    indication_rows = run_indication_researcher(molecule)
+    indication_rows = run_indication_researcher(molecule, args.company)
     lit_rows        = run_literature(molecule, args.sources)
 
     # ── assemble workbook ─────────────────────────────────────────────────────
