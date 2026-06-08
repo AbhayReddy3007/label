@@ -1,18 +1,10 @@
 """
 Drug Literature Fetcher — Multi-Source
-Fetches scientific literature for a drug from:
-  1. PubMed            (NCBI eUtils — free, no key)
-  2. Europe PMC        (REST API   — free, no key)
-  3. Semantic Scholar  (REST API   — free, no key)
-  4. OpenAlex          (REST API   — free, no key)
-  5. CORE              (REST API   — free, no key)
+Fetches scientific literature from PubMed, Europe PMC, Semantic Scholar,
+OpenAlex, and CORE. Extracts disease indications via Gemini 2.5 Flash.
 
-Extracts disease indications from abstracts using Gemini 2.5 Flash.
-Reads GEMINI_API_KEY from a .env file in the same directory.
-Always outputs → journals.xlsx
-
-Requirements:
-    pip install requests openpyxl python-dotenv
+Output: one indication per row in standardized format (same columns as
+label.py and drug_indication_researcher.py).
 
 Usage:
     python drug_literature_fetcher.py --drug "Semaglutide"
@@ -32,12 +24,13 @@ from openpyxl.utils import get_column_letter
 from datetime import datetime
 from pathlib import Path
 
-# ── Load .env ──────────────────────────────────────────────────────────────────
+from indication_standardizer import standardize_indication, classify_indication, process_indications
+
+# ── Load .env ─────────────────────────────────────────────────────────────────
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    # Fallback: manually parse .env if python-dotenv isn't installed
     env_file = Path(__file__).parent / ".env"
     if env_file.exists():
         for line in env_file.read_text().splitlines():
@@ -46,12 +39,12 @@ except ImportError:
                 k, _, v = line.partition("=")
                 os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
-# ── Constants ──────────────────────────────────────────────────────────────────
 GEMINI_API_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "gemini-2.5-flash:generateContent"
 )
 OUTPUT_FILE = "journals.xlsx"
+DEFAULT_MAX = 50
 
 SOURCE_COLORS = {
     "PubMed":           "2E6DA4",
@@ -61,12 +54,9 @@ SOURCE_COLORS = {
     "CORE":             "B8860B",
 }
 
-# Default per-source fetch limit (fetches as many as the API naturally returns)
-DEFAULT_MAX = 50
-
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SOURCE 1 — PubMed
+#  FETCHERS (unchanged logic)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_pubmed(drug: str, max_results: int = DEFAULT_MAX) -> list[dict]:
@@ -116,10 +106,6 @@ def _parse_pubmed_xml(xml_text: str, base_url: str) -> list[dict]:
     return articles
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SOURCE 2 — Europe PMC
-# ══════════════════════════════════════════════════════════════════════════════
-
 def fetch_europepmc(drug: str, max_results: int = DEFAULT_MAX) -> list[dict]:
     BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
     try:
@@ -156,10 +142,6 @@ def fetch_europepmc(drug: str, max_results: int = DEFAULT_MAX) -> list[dict]:
         print(f"  ⚠️  Europe PMC error: {e}")
         return []
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SOURCE 3 — Semantic Scholar
-# ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_semantic_scholar(drug: str, max_results: int = DEFAULT_MAX) -> list[dict]:
     BASE = "https://api.semanticscholar.org/graph/v1/paper/search"
@@ -201,18 +183,13 @@ def fetch_semantic_scholar(drug: str, max_results: int = DEFAULT_MAX) -> list[di
         return []
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SOURCE 4 — OpenAlex
-# ══════════════════════════════════════════════════════════════════════════════
-
 def fetch_openalex(drug: str, max_results: int = DEFAULT_MAX) -> list[dict]:
     BASE = "https://api.openalex.org/works"
     try:
         articles, page, per_page = [], 1, min(max_results, 50)
         while len(articles) < max_results:
             r = requests.get(BASE, params={
-                "search": drug,
-                "filter": "has_abstract:true",
+                "search": drug, "filter": "has_abstract:true",
                 "per-page": per_page, "page": page,
                 "select": "id,title,abstract_inverted_index,primary_location,doi",
             }, headers={"User-Agent": "DrugLitFetcher/2.0 (research tool)"}, timeout=20)
@@ -256,10 +233,6 @@ def _reconstruct_openalex_abstract(inverted_index: dict) -> str:
     return " ".join(pos_word[p] for p in sorted(pos_word))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SOURCE 5 — CORE
-# ══════════════════════════════════════════════════════════════════════════════
-
 def fetch_core(drug: str, max_results: int = DEFAULT_MAX) -> list[dict]:
     BASE = "https://api.core.ac.uk/v3/search/works"
     try:
@@ -276,7 +249,7 @@ def fetch_core(drug: str, max_results: int = DEFAULT_MAX) -> list[dict]:
             doi  = item.get("doi") or ""
             urls = item.get("sourceFulltextUrls") or []
             link = f"https://doi.org/{doi}" if doi else (urls[0] if urls else "https://core.ac.uk")
-            journals = item.get("journals") or []
+            journals     = item.get("journals") or []
             journal_name = journals[0].get("title", "N/A") if journals else "N/A"
             articles.append({
                 "source": "CORE",
@@ -293,7 +266,7 @@ def fetch_core(drug: str, max_results: int = DEFAULT_MAX) -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Deduplication
+#  Deduplication & Utilities
 # ══════════════════════════════════════════════════════════════════════════════
 
 def deduplicate(articles: list[dict]) -> list[dict]:
@@ -317,6 +290,15 @@ def _jaccard(a: str, b: str) -> float:
     if not sa or not sb:
         return 0.0
     return len(sa & sb) / len(sa | sb)
+
+
+def _rx(pattern, text, flags=0):
+    m = re.search(pattern, text, flags)
+    return m.group(1).strip() if m else ""
+
+
+def _strip_tags(text):
+    return re.sub(r"<[^>]+>", "", text).strip()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -363,153 +345,6 @@ def extract_indications(drug: str, title: str, abstract: str, api_key: str) -> l
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Excel Writer
-# ══════════════════════════════════════════════════════════════════════════════
-
-def write_excel(rows: list[dict], drug: str, source_stats: dict) -> None:
-    wb = openpyxl.Workbook()
-    _write_data_sheet(wb.active, rows, drug, source_stats)
-    ws2 = wb.create_sheet("Summary by Source")
-    _write_summary_sheet(ws2, rows, source_stats)
-    wb.save(OUTPUT_FILE)
-    print(f"\n✅  Saved → {OUTPUT_FILE}  ({len(rows)} articles)\n")
-
-
-def _thin_border():
-    return Border(
-        bottom=Side(style="thin", color="DDDDDD"),
-        right=Side(style="thin",  color="DDDDDD"),
-    )
-
-
-def _write_data_sheet(ws, rows, drug, source_stats):
-    thin    = _thin_border()
-    alt_fill = PatternFill("solid", start_color="F4F7FB")
-
-    # Title
-    ws.title = "All Results"
-    ws.merge_cells("A1:F1")
-    c = ws["A1"]
-    c.value     = f"Drug Indication Literature  —  {drug.title()}"
-    c.font      = Font(name="Arial", bold=True, size=14, color="1A1A2E")
-    c.alignment = Alignment(horizontal="left", vertical="center")
-    ws.row_dimensions[1].height = 32
-
-    # Meta
-    ws.merge_cells("A2:F2")
-    c = ws["A2"]
-    c.value = (
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}   |   "
-        f"Total articles: {len(rows)}   |   "
-        f"Sources: {', '.join(f'{s} ({n})' for s, n in source_stats.items() if n)}"
-    )
-    c.font      = Font(name="Arial", italic=True, size=9, color="888888")
-    c.alignment = Alignment(horizontal="left", vertical="center")
-    ws.row_dimensions[2].height = 16
-
-    # Headers
-    headers    = ["Drug", "Source", "Title / Journal", "Link", "Indication(s)", "Abstract (excerpt)"]
-    hfill      = PatternFill("solid", start_color="1A1A2E")
-    for col, h in enumerate(headers, 1):
-        c = ws.cell(row=3, column=col, value=h)
-        c.font      = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-        c.fill      = hfill
-        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        c.border    = thin
-    ws.row_dimensions[3].height = 22
-
-    # Rows
-    for idx, row in enumerate(rows, start=4):
-        row_fill   = alt_fill if idx % 2 == 0 else None
-        src_color  = SOURCE_COLORS.get(row["source"], "333333")
-
-        def _c(col, val, bold=False, color="111111", link=None):
-            cell = ws.cell(row=idx, column=col, value=val)
-            cell.font      = Font(name="Arial", size=9, bold=bold, color=color,
-                                  underline="single" if link else None)
-            cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
-            cell.border    = thin
-            if row_fill:
-                cell.fill = row_fill
-            if link:
-                cell.hyperlink = link
-            return cell
-
-        _c(1, row["drug"])
-        _c(2, row["source"], bold=True, color=src_color)
-        _c(3, f"{row['title']}\n{row['journal']}")
-        _c(4, row["link"], color="1A73E8", link=row["link"])
-        _c(5, row["indications"])
-        excerpt = row["abstract"][:300] + "…" if len(row["abstract"]) > 300 else row["abstract"]
-        _c(6, excerpt)
-
-        lines = max(row["indications"].count("\n") + 1, 2)
-        ws.row_dimensions[idx].height = max(36, 14 * lines)
-
-    for col, w in zip(range(1, 7), [10, 16, 44, 34, 32, 52]):
-        ws.column_dimensions[get_column_letter(col)].width = w
-    ws.freeze_panes = "A4"
-
-
-def _write_summary_sheet(ws, rows, source_stats):
-    thin = _thin_border()
-    hfill = PatternFill("solid", start_color="1A1A2E")
-    alt   = PatternFill("solid", start_color="F4F7FB")
-
-    ws["A1"].value = "Summary by Source"
-    ws["A1"].font  = Font(name="Arial", bold=True, size=13, color="1A1A2E")
-    ws.row_dimensions[1].height = 28
-
-    for col, h in enumerate(["Source", "Articles Fetched", "With Indications", "Unique Indications"], 1):
-        c = ws.cell(row=2, column=col, value=h)
-        c.font      = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-        c.fill      = hfill
-        c.alignment = Alignment(horizontal="center")
-        c.border    = thin
-
-    # Aggregate
-    agg = {}
-    for row in rows:
-        s = row["source"]
-        agg.setdefault(s, {"total": 0, "with_ind": 0, "indications": set()})
-        agg[s]["total"] += 1
-        inds = [
-            i.lstrip("• ").strip()
-            for i in row["indications"].split("\n")
-            if i.strip() and i.strip() != "No indication found"
-        ]
-        if inds:
-            agg[s]["with_ind"] += 1
-            agg[s]["indications"].update(inds)
-
-    for i, (src, data) in enumerate(agg.items(), start=3):
-        fill = alt if i % 2 == 0 else None
-        color = SOURCE_COLORS.get(src, "333333")
-        for col, val in enumerate([src, data["total"], data["with_ind"], len(data["indications"])], 1):
-            c = ws.cell(row=i, column=col, value=val)
-            c.font = Font(name="Arial", size=10, bold=(col == 1), color=color if col == 1 else "000000")
-            c.alignment = Alignment(horizontal="center" if col > 1 else "left")
-            c.border = thin
-            if fill:
-                c.fill = fill
-
-    for col, w in zip(range(1, 5), [22, 18, 20, 20]):
-        ws.column_dimensions[get_column_letter(col)].width = w
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Utilities
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _rx(pattern, text, flags=0):
-    m = re.search(pattern, text, flags)
-    return m.group(1).strip() if m else ""
-
-def _strip_tags(text):
-    return re.sub(r"<[^>]+>", "", text).strip()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 #  Source registry
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -520,6 +355,69 @@ SOURCES = {
     "openalex":        ("OpenAlex",         fetch_openalex),
     "core":            ("CORE",             fetch_core),
 }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COMMON FORMAT HEADERS (same as label.py / drug_indication_researcher.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+HEADERS    = ["molecule_name", "company_name", "indication", "indication_type",
+              "trial_title", "trial_id", "phase", "source_url", "data_source"]
+COL_WIDTHS = [18, 22, 28, 16, 50, 18, 10, 40, 16]
+
+
+def _thin_border():
+    return Border(bottom=Side(style="thin", color="DDDDDD"),
+                  right=Side(style="thin", color="DDDDDD"))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Excel Writer — common format
+# ══════════════════════════════════════════════════════════════════════════════
+
+def write_excel(rows: list[dict], drug: str, source_stats: dict) -> None:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Literature"
+
+    thin     = _thin_border()
+    hfill    = PatternFill("solid", start_color="1A1A2E")
+    alt_fill = PatternFill("solid", start_color="F4F7FB")
+    ncols    = len(HEADERS)
+
+    ws.merge_cells(f"A1:{get_column_letter(ncols)}1")
+    c = ws["A1"]
+    c.value     = f"Drug Literature  —  {drug.title()}"
+    c.font      = Font(name="Arial", bold=True, size=14, color="1A1A2E")
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[1].height = 32
+
+    for col, h in enumerate(HEADERS, 1):
+        c           = ws.cell(row=2, column=col, value=h)
+        c.font      = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+        c.fill      = hfill
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border    = thin
+    ws.row_dimensions[2].height = 22
+
+    for idx, row in enumerate(rows, start=3):
+        fill = alt_fill if idx % 2 == 1 else None
+        for col, key in enumerate(HEADERS, 1):
+            c           = ws.cell(row=idx, column=col, value=row.get(key, ""))
+            c.font      = Font(name="Arial", size=9)
+            c.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+            c.border    = thin
+            if fill:
+                c.fill = fill
+        ws.row_dimensions[idx].height = 18
+
+    ws.auto_filter.ref = f"A2:{get_column_letter(ncols)}{2 + len(rows)}"
+    ws.freeze_panes = "A3"
+    for i, w in enumerate(COL_WIDTHS, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    wb.save(OUTPUT_FILE)
+    print(f"\n✅  Saved → {OUTPUT_FILE}  ({len(rows)} rows)\n")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -535,14 +433,9 @@ def main():
                         help=f"Comma-separated or 'all'. Options: {', '.join(SOURCES)}")
     args = parser.parse_args()
 
-    # ── API key from .env ──────────────────────────────────────────────────────
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
-        sys.exit(
-            "❌  GEMINI_API_KEY not found.\n"
-            "    Add it to a .env file in the same directory:\n"
-            "    GEMINI_API_KEY=AIza..."
-        )
+        sys.exit("❌  GEMINI_API_KEY not found in .env")
 
     drug = args.drug.strip()
 
@@ -551,7 +444,7 @@ def main():
     else:
         active = [s.strip().lower() for s in args.sources.split(",") if s.strip().lower() in SOURCES]
         if not active:
-            sys.exit(f"❌  No valid sources specified. Choose from: {', '.join(SOURCES)}")
+            sys.exit(f"❌  No valid sources. Choose from: {', '.join(SOURCES)}")
 
     print(f"\n{'━'*62}")
     print(f"  Drug    : {drug.title()}")
@@ -559,9 +452,8 @@ def main():
     print(f"  Output  : {OUTPUT_FILE}")
     print(f"{'━'*62}\n")
 
-    # ── Fetch ──────────────────────────────────────────────────────────────────
-    all_articles = []
-    source_stats = {}
+    # ── Fetch ─────────────────────────────────────────────────────────────────
+    all_articles, source_stats = [], {}
     for key in active:
         label, fn = SOURCES[key]
         print(f"📡  {label} …")
@@ -576,24 +468,32 @@ def main():
     all_articles = deduplicate(all_articles)
     print(f"✂️   After dedup      : {len(all_articles)}\n")
 
-    # ── Gemini ─────────────────────────────────────────────────────────────────
+    # ── Gemini → standardize → unnest ─────────────────────────────────────────
     print("🤖  Extracting indications with Gemini 2.5 Flash …\n")
     rows = []
     for i, article in enumerate(all_articles, 1):
         print(f"  [{i:>3}/{len(all_articles)}] [{article['source']}] {article['title'][:65]}")
-        inds = extract_indications(drug, article["title"], article["abstract"], api_key)
+        raw_inds = extract_indications(drug, article["title"], article["abstract"], api_key)
         time.sleep(0.2)
-        rows.append({
-            "drug":        drug.title(),
-            "source":      article["source"],
-            "title":       article["title"],
-            "journal":     article["journal"],
-            "link":        article["link"],
-            "abstract":    article["abstract"],
-            "indications": "\n".join(f"• {x}" for x in inds) if inds else "No indication found",
-        })
 
-    # ── Excel ──────────────────────────────────────────────────────────────────
+        processed = process_indications(drug, raw_inds)
+        if not processed:
+            processed = [{"indication": "No indication found", "indication_type": ""}]
+
+        for ind in processed:
+            rows.append({
+                "molecule_name":   drug.title(),
+                "company_name":    article["source"],   # literature source as "company"
+                "indication":      ind["indication"],
+                "indication_type": ind["indication_type"],
+                "trial_title":     article["title"],
+                "trial_id":        "",                   # no trial_id for literature
+                "phase":           "",                   # no phase for literature
+                "source_url":      article["link"],
+                "data_source":     "Literature",
+            })
+
+    # ── Excel ─────────────────────────────────────────────────────────────────
     print(f"\n📊  Writing {OUTPUT_FILE} …")
     write_excel(rows, drug, source_stats)
 
