@@ -147,6 +147,7 @@ Rules:
                 "company_name":    row.get("company_name"),
                 "indication":      ind["indication"],
                 "indication_type": ind["indication_type"],
+                "therapy_area":    ind["therapy_area"],
                 "trial_title":     trial_title if 'trial_title' in dir() else cp.get("trial_title", ""),
                 "trial_id":        trial_id,
                 "phase":           row.get("phase"),
@@ -160,8 +161,8 @@ Rules:
 
 # ── COMMON FORMAT HEADERS ────────────────────────────────────────────────────
 HEADERS    = ["molecule_name", "company_name", "indication", "indication_type",
-              "trial_title", "trial_id", "phase", "source_url", "data_source"]
-COL_WIDTHS = [18, 22, 28, 16, 50, 18, 10, 40, 16]
+              "therapy_area", "trial_title", "trial_id", "phase", "source_url", "data_source"]
+COL_WIDTHS = [18, 22, 28, 16, 18, 50, 18, 10, 40, 16]
 
 
 def _thin_border():
