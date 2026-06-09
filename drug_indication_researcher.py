@@ -6,13 +6,14 @@ Researches drug indications EXCLUSIVELY from innovator / investor sources:
   - Company pipeline pages
   - FDA / EMA regulatory labels (by the innovator)
   - Press releases & earnings calls by the innovator company
+  - SEC filings (10-K, 10-Q, 8-K, 20-F, 6-K) by the innovator company
 
 Does NOT use BigQuery or clinical trial databases.
 Uses Gemini 2.5 Flash with Google Search grounding.
 
-Key difference from label.py (clinical trials) and drug_literature_fetcher.py
-(journals): this file captures what the INNOVATOR COMPANY says about the drug
-in their own materials. Each row = one indication × one source document.
+Key difference from label.py (clinical trials): this file captures what the
+INNOVATOR COMPANY says about the drug in their own materials.
+Each row = one indication × one source document.
 
 Output: one indication per row in standardized format.
 
@@ -39,6 +40,33 @@ load_dotenv(override=True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 gemini_client  = genai.Client(api_key=GEMINI_API_KEY)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECONDARY INDICATION CRITERIA PROMPT
+#  Applied when extracting indications from any source document.
+# ══════════════════════════════════════════════════════════════════════════════
+
+SECONDARY_INDICATION_CRITERIA = """
+A SECONDARY INDICATION must meet ALL of the following criteria:
+
+1. TRUE EXPANSION: The indication represents a true expansion — it is not part of
+   the primary indication (for clinical assets) or currently approved label
+   (for commercial assets).
+
+2. DISEASE-LEVEL DEFINITION: The indication is described at a clear disease-level
+   definition, avoiding vague, overlapping, or synonymous representations.
+
+3. EVIDENCE OF OUTCOMES: The source must describe observed or measured outcomes in
+   that specific indication (e.g., trial results, endpoint readouts, biomarker
+   response), not just planned evaluation or exploratory intent.
+
+The following must NOT be considered secondary indications:
+  * Indications mentioned only as hypotheses, targets, or exploratory possibilities
+  * Pipeline indications without any data or outcomes
+  * Mechanism-based assumptions without clinical or empirical validation
+  * Early discovery or preclinical signals without human data
+  * Any indication lacking traceable, verifiable evidence of results
+"""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -78,10 +106,6 @@ def identify_company(molecule: str) -> str:
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  STEP 2 — Research queries, each targeting a specific innovator source type
-#
-#  CRITICAL: prompts ask Gemini to return EACH source document as a separate
-#  entry, with the real document title, URL, phase, and brand name.
-#  This is what makes the output different from clinical-trial data.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_queries(molecule: str, company: str) -> list[dict]:
@@ -94,14 +118,14 @@ def _build_queries(molecule: str, company: str) -> list[dict]:
                 f"for {molecule} (by {company}).\n\n"
                 f"For EACH approved indication found in those labels, return a separate entry.\n\n"
                 f"Return ONLY valid JSON:\n"
-                f'{{"entries": [\n'
+                f'{{\"entries\": [\n'
                 f'  {{\n'
-                f'    "indication": "<disease or condition>",\n'
-                f'    "brand_name": "<commercial brand name, e.g. Ozempic, Wegovy>",\n'
-                f'    "source_document": "<exact label title, e.g. Ozempic FDA Prescribing Information>",\n'
-                f'    "phase": "Approved",\n'
-                f'    "source_url": "<URL to the label or DailyMed page>",\n'
-                f'    "detail": "<approval year, patient population, dose>"\n'
+                f'    \"indication\": \"<disease or condition>\",\n'
+                f'    \"brand_name\": \"<commercial brand name, e.g. Ozempic, Wegovy>\",\n'
+                f'    \"source_document\": \"<exact label title, e.g. Ozempic FDA Prescribing Information>\",\n'
+                f'    \"phase\": \"Approved\",\n'
+                f'    \"source_url\": \"<URL to the label or DailyMed page>\",\n'
+                f'    \"detail\": \"<approval year, patient population, dose>\"\n'
                 f"  }}\n"
                 f"]}}\n\n"
                 f"IMPORTANT:\n"
@@ -120,21 +144,23 @@ def _build_queries(molecule: str, company: str) -> list[dict]:
                 f"that mention {molecule}.\n\n"
                 f"For EACH indication mentioned for {molecule} in these presentations, "
                 f"return a separate entry.\n\n"
+                f"{SECONDARY_INDICATION_CRITERIA}\n"
                 f"Return ONLY valid JSON:\n"
-                f'{{"entries": [\n'
+                f'{{\"entries\": [\n'
                 f'  {{\n'
-                f'    "indication": "<disease or condition>",\n'
-                f'    "brand_name": "<brand name if mentioned>",\n'
-                f'    "source_document": "<exact presentation title, e.g. Novo Nordisk Capital Markets Day 2024>",\n'
-                f'    "phase": "<Phase 1 / Phase 2 / Phase 3 / Filed / Approved / Launched>",\n'
-                f'    "source_url": "<URL to the presentation PDF or page>",\n'
-                f'    "detail": "<specific claim, trial name, or pipeline status from the slide>"\n'
+                f'    \"indication\": \"<disease or condition>\",\n'
+                f'    \"brand_name\": \"<brand name if mentioned>\",\n'
+                f'    \"source_document\": \"<exact presentation title, e.g. Novo Nordisk Capital Markets Day 2024>\",\n'
+                f'    \"phase\": \"<Phase 1 / Phase 2 / Phase 3 / Filed / Approved / Launched>\",\n'
+                f'    \"source_url\": \"<URL to the presentation PDF or page>\",\n'
+                f'    \"detail\": \"<specific claim, trial name, or pipeline status from the slide>\"\n'
                 f"  }}\n"
                 f"]}}\n\n"
                 f"IMPORTANT:\n"
                 f"- source_document must be the REAL title of the presentation, not a generic label\n"
                 f"- Include the year in the source_document title\n"
                 f"- detail should quote or paraphrase specific claims from the presentation\n"
+                f"- Only include indications with observed outcomes data — not exploratory mentions\n"
                 f"- No explanation, only JSON"
             ),
         },
@@ -146,20 +172,22 @@ def _build_queries(molecule: str, company: str) -> list[dict]:
                 f"from {company} about {molecule}.\n\n"
                 f"For EACH indication mentioned in these press releases or earnings calls, "
                 f"return a separate entry.\n\n"
+                f"{SECONDARY_INDICATION_CRITERIA}\n"
                 f"Return ONLY valid JSON:\n"
-                f'{{"entries": [\n'
+                f'{{\"entries\": [\n'
                 f'  {{\n'
-                f'    "indication": "<disease or condition>",\n'
-                f'    "brand_name": "<brand name if mentioned>",\n'
-                f'    "source_document": "<exact press release title or earnings call date>",\n'
-                f'    "phase": "<Phase 1 / Phase 2 / Phase 3 / Filed / Approved / Launched>",\n'
-                f'    "source_url": "<URL to the press release>",\n'
-                f'    "detail": "<key announcement: approval, trial result, filing, etc.>"\n'
+                f'    \"indication\": \"<disease or condition>\",\n'
+                f'    \"brand_name\": \"<brand name if mentioned>\",\n'
+                f'    \"source_document\": \"<exact press release title or earnings call date>\",\n'
+                f'    \"phase\": \"<Phase 1 / Phase 2 / Phase 3 / Filed / Approved / Launched>\",\n'
+                f'    \"source_url\": \"<URL to the press release>\",\n'
+                f'    \"detail\": \"<key announcement: approval, trial result, filing, etc.>\"\n'
                 f"  }}\n"
                 f"]}}\n\n"
                 f"IMPORTANT:\n"
                 f"- source_document must be the REAL press release headline or earnings call date\n"
                 f"- detail should include the specific news (e.g. FDA approval, Phase 3 results)\n"
+                f"- Only include indications backed by reported outcomes, not future plans\n"
                 f"- No explanation, only JSON"
             ),
         },
@@ -170,20 +198,54 @@ def _build_queries(molecule: str, company: str) -> list[dict]:
                 f"Search the web for {company}'s official pipeline page or product portfolio page "
                 f"that lists {molecule}.\n\n"
                 f"For EACH indication listed for {molecule} on the pipeline, return a separate entry.\n\n"
+                f"{SECONDARY_INDICATION_CRITERIA}\n"
                 f"Return ONLY valid JSON:\n"
-                f'{{"entries": [\n'
+                f'{{\"entries\": [\n'
                 f'  {{\n'
-                f'    "indication": "<disease or condition>",\n'
-                f'    "brand_name": "<brand name if shown>",\n'
-                f'    "source_document": "<e.g. Novo Nordisk Pipeline — as of Q1 2025>",\n'
-                f'    "phase": "<Preclinical / Phase 1 / Phase 2 / Phase 3 / Filed / Approved>",\n'
-                f'    "source_url": "<URL to the pipeline page>",\n'
-                f'    "detail": "<any additional status note from the pipeline>"\n'
+                f'    \"indication\": \"<disease or condition>\",\n'
+                f'    \"brand_name\": \"<brand name if shown>\",\n'
+                f'    \"source_document\": \"<e.g. Novo Nordisk Pipeline — as of Q1 2025>\",\n'
+                f'    \"phase\": \"<Preclinical / Phase 1 / Phase 2 / Phase 3 / Filed / Approved>\",\n'
+                f'    \"source_url\": \"<URL to the pipeline page>\",\n'
+                f'    \"detail\": \"<any additional status note from the pipeline>\"\n'
                 f"  }}\n"
                 f"]}}\n\n"
                 f"IMPORTANT:\n"
                 f"- One entry per indication × phase combination\n"
                 f"- phase MUST be filled with the development stage shown on the pipeline\n"
+                f"- Exclude Preclinical and early discovery entries (no human data)\n"
+                f"- No explanation, only JSON"
+            ),
+        },
+        # ── 5. SEC filings (10-K, 10-Q, 8-K, 20-F, 6-K) ─────────────────
+        {
+            "source_type": "SEC Filing",
+            "prompt": (
+                f"Search the SEC EDGAR database and the web for SEC filings by {company} "
+                f"(10-K annual reports, 10-Q quarterly reports, 8-K current reports, "
+                f"20-F annual reports for foreign private issuers, 6-K reports) "
+                f"that disclose clinical or regulatory information about {molecule}.\n\n"
+                f"For EACH indication described with actual clinical data or regulatory outcomes "
+                f"in these filings, return a separate entry.\n\n"
+                f"{SECONDARY_INDICATION_CRITERIA}\n"
+                f"Return ONLY valid JSON:\n"
+                f'{{\"entries\": [\n'
+                f'  {{\n'
+                f'    \"indication\": \"<disease or condition>\",\n'
+                f'    \"brand_name\": \"<brand name if mentioned>\",\n'
+                f'    \"source_document\": \"<exact filing type and period, e.g. {company} 10-K FY2024, {company} 8-K dated 2024-03-15>\",\n'
+                f'    \"phase\": \"<Phase 1 / Phase 2 / Phase 3 / Filed / Approved / Launched>\",\n'
+                f'    \"source_url\": \"<URL to the SEC EDGAR filing or press release>\",\n'
+                f'    \"detail\": \"<specific disclosed data: trial outcome, milestone, risk factor, MD&A discussion>\"\n'
+                f"  }}\n"
+                f"]}}\n\n"
+                f"IMPORTANT:\n"
+                f"- source_document must identify the exact filing type, company, and reporting period\n"
+                f"- Only include indications where the filing reports actual results or regulatory "
+                f"  decisions — not forward-looking statements or risk factor boilerplate\n"
+                f"- detail must reference the specific section of the filing (e.g. 'Business — Products', "
+                f"  'MD&A', 'Risk Factors', 'Item 8-K Exhibit 99.1') where the data appears\n"
+                f"- Prioritize 8-K filings that announce trial readouts, FDA approvals, or NDA/BLA submissions\n"
                 f"- No explanation, only JSON"
             ),
         },
@@ -192,11 +254,6 @@ def _build_queries(molecule: str, company: str) -> list[dict]:
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  STEP 3 — Run research + build rows
-#
-#  Unlike label.py which has one row per trial, here each row =
-#  one indication × one innovator source document. We do NOT deduplicate
-#  across source types — that's the point: seeing the same indication
-#  across an FDA label, an investor deck, and a press release.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def research_indications(molecule: str, company: str) -> list[dict]:
@@ -218,8 +275,10 @@ def research_indications(molecule: str, company: str) -> list[dict]:
                     system_instruction=(
                         "You are a pharmaceutical analyst researching what the "
                         "innovator company publicly says about this drug. "
-                        "Search the web. Return ONLY valid JSON — no markdown, "
-                        "no explanation, no commentary."
+                        "Search the web and SEC EDGAR. Return ONLY valid JSON — no markdown, "
+                        "no explanation, no commentary. "
+                        "Apply strict secondary indication criteria: only include indications "
+                        "with documented, verifiable clinical outcomes."
                     ),
                 ),
             )
@@ -285,8 +344,12 @@ def _fallback_extract(molecule, company, source_type, raw_text, all_rows):
     try:
         prompt = (
             f"The following text is about {molecule} by {company}.\n"
-            f"Extract every disease indication mentioned.\n"
+            f"Extract every disease indication mentioned that has documented clinical outcomes.\n"
             f"Return ONLY a JSON array: [\"indication1\", \"indication2\"]\n\n"
+            f"Strict rules — DO NOT include:\n"
+            f"- Hypothetical or exploratory mentions without outcome data\n"
+            f"- Preclinical or mechanism-based claims\n"
+            f"- Pipeline entries with no trial results reported\n\n"
             f"Text:\n{raw_text[:3000]}"
         )
         resp = gemini_client.models.generate_content(
@@ -323,7 +386,7 @@ def _fallback_extract(molecule, company, source_type, raw_text, all_rows):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  EXCEL — same column format as label.py / drug_literature_fetcher.py
+#  EXCEL — same column format as label.py
 # ══════════════════════════════════════════════════════════════════════════════
 
 HEADERS    = ["molecule_name", "company_name", "indication", "indication_type",
@@ -390,7 +453,7 @@ def write_excel(rows, molecule_name):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Research drug indications from innovator/investor sources (Gemini + Google Search)"
+        description="Research drug indications from innovator/investor/SEC sources (Gemini + Google Search)"
     )
     parser.add_argument("molecule_name", help="Drug/molecule name, e.g. semaglutide")
     parser.add_argument("--company", default=None,
@@ -403,7 +466,7 @@ def main():
     if not GEMINI_API_KEY:
         sys.exit("❌  GEMINI_API_KEY not set in .env")
 
-    print(f"\n🚀 Drug Indication Researcher (Innovator Sources)")
+    print(f"\n🚀 Drug Indication Researcher (Innovator + SEC Sources)")
     print(f"   Molecule : {molecule.title()}")
 
     # Auto-detect company if not provided
@@ -416,11 +479,11 @@ def main():
     else:
         print(f"   Company  : {company}")
 
-    print(f"\n[1/2] Researching innovator sources for {molecule.title()} ({company})…")
+    print(f"\n[1/2] Researching innovator + SEC sources for {molecule.title()} ({company})…")
     rows = research_indications(molecule, company)
 
     if not rows:
-        print("❌ No indications found from innovator sources")
+        print("❌ No indications found from innovator/SEC sources")
         return
 
     print(f"\n[2/2] Generating Excel…")
