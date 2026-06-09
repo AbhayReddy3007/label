@@ -136,28 +136,52 @@ Rules:
 - No explanations, only JSON
 """
             try:
-                response = gemini_client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0,
-                        system_instruction="Return ONLY valid JSON output"
-                    ),
-                )
-                text = response.text.strip()
-                text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
-                data = json.loads(text)
-                conditions = data.get("conditions", [])
-                trial_title = data.get("trial_title", "N/A")
-                if isinstance(conditions, list):
-                    conditions = list(set(c.strip() for c in conditions))
+                import threading
+
+                result_holder = {}
+                error_holder  = {}
+
+                def _call_gemini():
+                    try:
+                        resp = gemini_client.models.generate_content(
+                            model="gemini-2.5-flash",
+                            contents=prompt,
+                            config=types.GenerateContentConfig(
+                                temperature=0,
+                                system_instruction="Return ONLY valid JSON output"
+                            ),
+                        )
+                        result_holder["response"] = resp
+                    except Exception as ex:
+                        error_holder["error"] = ex
+
+                thread = threading.Thread(target=_call_gemini, daemon=True)
+                thread.start()
+                thread.join(timeout=60)
+
+                if thread.is_alive():
+                    print(f"   ⏱️  Timeout (>60s) — skipping trial {trial_id}")
+                    conditions  = []
+                    trial_title = "Skipped (timeout)"
+                elif "error" in error_holder:
+                    raise error_holder["error"]
                 else:
-                    conditions = [str(conditions)]
-                print(f"   ✅ {', '.join(conditions)}")
-                checkpoint[trial_id] = {"conditions": conditions, "trial_title": trial_title}
-                save_checkpoint(checkpoint_file, checkpoint)
+                    response    = result_holder["response"]
+                    text        = response.text.strip()
+                    text        = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+                    data        = json.loads(text)
+                    conditions  = data.get("conditions", [])
+                    trial_title = data.get("trial_title", "N/A")
+                    if isinstance(conditions, list):
+                        conditions = list(set((c or "").strip() for c in conditions if c))
+                    else:
+                        conditions = [str(conditions)]
+                    print(f"   ✅ {', '.join(conditions) if conditions else 'no secondary indications'}")
+                    checkpoint[trial_id] = {"conditions": conditions, "trial_title": trial_title}
+                    save_checkpoint(checkpoint_file, checkpoint)
+
             except Exception as e:
-                conditions = ["Error"]
+                conditions  = []
                 trial_title = str(e)
                 print(f"   ❌ Error: {e}")
 
