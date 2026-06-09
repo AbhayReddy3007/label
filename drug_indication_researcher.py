@@ -47,25 +47,22 @@ gemini_client  = genai.Client(api_key=GEMINI_API_KEY)
 # ══════════════════════════════════════════════════════════════════════════════
 
 SECONDARY_INDICATION_CRITERIA = """
-A SECONDARY INDICATION must meet ALL of the following criteria:
+You must extract ONLY secondary indications. Do NOT include the primary indication.
 
-1. TRUE EXPANSION: The indication represents a true expansion — it is not part of
-   the primary indication (for clinical assets) or currently approved label
-   (for commercial assets).
+A secondary indication qualifies ONLY if ALL of the following are true:
 
-2. DISEASE-LEVEL DEFINITION: The indication is described at a clear disease-level
-   definition, avoiding vague, overlapping, or synonymous representations.
-
-3. EVIDENCE OF OUTCOMES: The source must describe observed or measured outcomes in
-   that specific indication (e.g., trial results, endpoint readouts, biomarker
-   response), not just planned evaluation or exploratory intent.
+- The indication represents a true expansion — i.e., it is not part of the primary indication (for clinical assets) or currently approved label (for commercial assets)
+- The indication is described at a clear disease-level definition, avoiding vague, overlapping, or synonymous representations
+- The source must describe observed or measured outcomes in that specific indication (e.g., trial results, endpoint readouts, biomarker response), not just planned evaluation or exploratory intent
 
 The following must NOT be considered secondary indications:
-  * Indications mentioned only as hypotheses, targets, or exploratory possibilities
-  * Pipeline indications without any data or outcomes
-  * Mechanism-based assumptions without clinical or empirical validation
-  * Early discovery or preclinical signals without human data
-  * Any indication lacking traceable, verifiable evidence of results
+* Indications mentioned only as hypothesis, targets, or exploratory possibilities
+* Pipeline indications without any data or outcomes
+* Mechanism based assumptions without clinical or empirical validation
+* Early discovery or preclinical signals without human data
+* Any indication lacking traceable, verifiable evidence of results
+
+If no indication meets these criteria, return an empty list [].
 """
 
 
