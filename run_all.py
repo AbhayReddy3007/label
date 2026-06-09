@@ -67,25 +67,22 @@ from openpyxl.utils import get_column_letter
 # ══════════════════════════════════════════════════════════════════════════════
 
 SECONDARY_INDICATION_CRITERIA = """
-A SECONDARY INDICATION must meet ALL of the following criteria:
+You must extract ONLY secondary indications. Do NOT include the primary indication.
 
-1. TRUE EXPANSION: The indication represents a true expansion — it is not part of
-   the primary indication (for clinical assets) or currently approved label
-   (for commercial assets).
+A secondary indication qualifies ONLY if ALL of the following are true:
 
-2. DISEASE-LEVEL DEFINITION: The indication is described at a clear disease-level
-   definition, avoiding vague, overlapping, or synonymous representations.
-
-3. EVIDENCE OF OUTCOMES: The source must describe observed or measured outcomes in
-   that specific indication (e.g., trial results, endpoint readouts, biomarker
-   response), not just planned evaluation or exploratory intent.
+- The indication represents a true expansion — i.e., it is not part of the primary indication (for clinical assets) or currently approved label (for commercial assets)
+- The indication is described at a clear disease-level definition, avoiding vague, overlapping, or synonymous representations
+- The source must describe observed or measured outcomes in that specific indication (e.g., trial results, endpoint readouts, biomarker response), not just planned evaluation or exploratory intent
 
 The following must NOT be considered secondary indications:
-  * Indications mentioned only as hypotheses, targets, or exploratory possibilities
-  * Pipeline indications without any data or outcomes
-  * Mechanism-based assumptions without clinical or empirical validation
-  * Early discovery or preclinical signals without human data
-  * Any indication lacking traceable, verifiable evidence of results
+* Indications mentioned only as hypothesis, targets, or exploratory possibilities
+* Pipeline indications without any data or outcomes
+* Mechanism based assumptions without clinical or empirical validation
+* Early discovery or preclinical signals without human data
+* Any indication lacking traceable, verifiable evidence of results
+
+If no indication meets these criteria, return an empty list [].
 """
 
 
@@ -175,7 +172,7 @@ def _gemini_enrich_trials(rows: list[dict], molecule_name: str,
             prompt = f"""
 You are a clinical trial data assistant.
 
-Extract from the given trial:
+Trial details:
 Molecule: {row.get('molecule_name')}
 Company:  {row.get('company_name')}
 Trial ID: {trial_id}
@@ -186,15 +183,13 @@ Source URL: {row.get('source_url')}
 
 Return ONLY valid JSON:
 {{
-  "conditions": ["condition1", "condition2"],
+  "conditions": ["secondary_indication_1", "secondary_indication_2"],
   "trial_title": "<trial title>"
 }}
 
 Rules:
-- ALWAYS return conditions as a list
-- If only one condition → list with one item
-- For each condition beyond the primary, apply the secondary indication criteria above:
-  only include it if it represents a true expansion with documented outcomes
+- Return ONLY secondary indications in the conditions list — do NOT include the primary indication
+- If no secondary indications qualify, return: {{"conditions": [], "trial_title": "<trial title>"}}
 - No explanations, only JSON
 """
             try:
