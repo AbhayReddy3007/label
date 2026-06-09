@@ -38,6 +38,32 @@ GBQ_SERVICE_KEY = os.getenv(
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECONDARY INDICATION CRITERIA
+# ══════════════════════════════════════════════════════════════════════════════
+
+SECONDARY_INDICATION_CRITERIA = """
+A SECONDARY INDICATION must meet ALL of the following criteria:
+
+1. TRUE EXPANSION: The indication represents a true expansion — it is not part of
+   the primary indication (for clinical assets) or currently approved label
+   (for commercial assets).
+
+2. DISEASE-LEVEL DEFINITION: The indication is described at a clear disease-level
+   definition, avoiding vague, overlapping, or synonymous representations.
+
+3. EVIDENCE OF OUTCOMES: The source must describe observed or measured outcomes in
+   that specific indication (e.g., trial results, endpoint readouts, biomarker
+   response), not just planned evaluation or exploratory intent.
+
+The following must NOT be considered secondary indications:
+  * Indications mentioned only as hypotheses, targets, or exploratory possibilities
+  * Pipeline indications without any data or outcomes
+  * Mechanism-based assumptions without clinical or empirical validation
+  * Early discovery or preclinical signals without human data
+  * Any indication lacking traceable, verifiable evidence of results
+"""
+
 def _bq_client():
     credentials = service_account.Credentials.from_service_account_file(
         GBQ_SERVICE_KEY,
@@ -99,6 +125,8 @@ Trial ID: {trial_id}
 Phase: {row.get('phase')}
 Source URL: {row.get('source_url')}
 
+{SECONDARY_INDICATION_CRITERIA}
+
 Return ONLY valid JSON:
 {{
   "conditions": ["condition1", "condition2"],
@@ -108,6 +136,8 @@ Return ONLY valid JSON:
 Rules:
 - ALWAYS return conditions as a list
 - If only one condition → list with one item
+- For each condition beyond the primary, apply the secondary indication criteria above:
+  only include it if it represents a true expansion with documented outcomes
 - No explanations, only JSON
 """
             try:
