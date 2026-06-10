@@ -27,6 +27,7 @@ import os
 import json
 import re
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -40,6 +41,9 @@ load_dotenv(override=True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 gemini_client  = genai.Client(api_key=GEMINI_API_KEY)
+
+# ── Parallel config ───────────────────────────────────────────────────────────
+MAX_WORKERS = 5  # parallel Gemini calls for innovator source queries
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SECONDARY INDICATION CRITERIA PROMPT
@@ -115,14 +119,15 @@ def _build_queries(molecule: str, company: str) -> list[dict]:
                 f"for {molecule} (by {company}).\n\n"
                 f"For EACH approved indication found in those labels, return a separate entry.\n\n"
                 f"Return ONLY valid JSON:\n"
-                f'{{\"entries\": [\n'
+                f'{{"entries": [\n'
                 f'  {{\n'
-                f'    \"indication\": \"<disease or condition>\",\n'
-                f'    \"brand_name\": \"<commercial brand name, e.g. Ozempic, Wegovy>\",\n'
-                f'    \"source_document\": \"<exact label title, e.g. Ozempic FDA Prescribing Information>\",\n'
-                f'    \"phase\": \"Approved\",\n'
-                f'    \"source_url\": \"<URL to the label or DailyMed page>\",\n'
-                f'    \"detail\": \"<approval year, patient population, dose>\"\n'
+                f'    "indication": "<disease or condition>",\n'
+                f'    "brand_name": "<commercial brand name, e.g. Ozempic, Wegovy>",\n'
+                f'    "source_document": "<exact label title, e.g. Ozempic FDA Prescribing Information>",\n'
+                f'    "phase": "Approved",\n'
+                f'    "source_url": "<URL to the label or DailyMed page>",\n'
+                f'    "detail": "<approval year, patient population, dose>",\n'
+                f'    "rationale": "<why this indication was identified — cite the specific label section or approval>"\n'
                 f"  }}\n"
                 f"]}}\n\n"
                 f"IMPORTANT:\n"
@@ -143,14 +148,15 @@ def _build_queries(molecule: str, company: str) -> list[dict]:
                 f"return a separate entry.\n\n"
                 f"{SECONDARY_INDICATION_CRITERIA}\n"
                 f"Return ONLY valid JSON:\n"
-                f'{{\"entries\": [\n'
+                f'{{"entries": [\n'
                 f'  {{\n'
-                f'    \"indication\": \"<disease or condition>\",\n'
-                f'    \"brand_name\": \"<brand name if mentioned>\",\n'
-                f'    \"source_document\": \"<exact presentation title, e.g. Novo Nordisk Capital Markets Day 2024>\",\n'
-                f'    \"phase\": \"<Phase 1 / Phase 2 / Phase 3 / Filed / Approved / Launched>\",\n'
-                f'    \"source_url\": \"<URL to the presentation PDF or page>\",\n'
-                f'    \"detail\": \"<specific claim, trial name, or pipeline status from the slide>\"\n'
+                f'    "indication": "<disease or condition>",\n'
+                f'    "brand_name": "<brand name if mentioned>",\n'
+                f'    "source_document": "<exact presentation title, e.g. Novo Nordisk Capital Markets Day 2024>",\n'
+                f'    "phase": "<Phase 1 / Phase 2 / Phase 3 / Filed / Approved / Launched>",\n'
+                f'    "source_url": "<URL to the presentation PDF or page>",\n'
+                f'    "detail": "<specific claim, trial name, or pipeline status from the slide>",\n'
+                f'    "rationale": "<why this indication was identified — cite the specific evidence from the presentation>"\n'
                 f"  }}\n"
                 f"]}}\n\n"
                 f"IMPORTANT:\n"
@@ -171,14 +177,15 @@ def _build_queries(molecule: str, company: str) -> list[dict]:
                 f"return a separate entry.\n\n"
                 f"{SECONDARY_INDICATION_CRITERIA}\n"
                 f"Return ONLY valid JSON:\n"
-                f'{{\"entries\": [\n'
+                f'{{"entries": [\n'
                 f'  {{\n'
-                f'    \"indication\": \"<disease or condition>\",\n'
-                f'    \"brand_name\": \"<brand name if mentioned>\",\n'
-                f'    \"source_document\": \"<exact press release title or earnings call date>\",\n'
-                f'    \"phase\": \"<Phase 1 / Phase 2 / Phase 3 / Filed / Approved / Launched>\",\n'
-                f'    \"source_url\": \"<URL to the press release>\",\n'
-                f'    \"detail\": \"<key announcement: approval, trial result, filing, etc.>\"\n'
+                f'    "indication": "<disease or condition>",\n'
+                f'    "brand_name": "<brand name if mentioned>",\n'
+                f'    "source_document": "<exact press release title or earnings call date>",\n'
+                f'    "phase": "<Phase 1 / Phase 2 / Phase 3 / Filed / Approved / Launched>",\n'
+                f'    "source_url": "<URL to the press release>",\n'
+                f'    "detail": "<key announcement: approval, trial result, filing, etc.>",\n'
+                f'    "rationale": "<why this indication was identified — cite the specific news or data>"\n'
                 f"  }}\n"
                 f"]}}\n\n"
                 f"IMPORTANT:\n"
@@ -197,14 +204,15 @@ def _build_queries(molecule: str, company: str) -> list[dict]:
                 f"For EACH indication listed for {molecule} on the pipeline, return a separate entry.\n\n"
                 f"{SECONDARY_INDICATION_CRITERIA}\n"
                 f"Return ONLY valid JSON:\n"
-                f'{{\"entries\": [\n'
+                f'{{"entries": [\n'
                 f'  {{\n'
-                f'    \"indication\": \"<disease or condition>\",\n'
-                f'    \"brand_name\": \"<brand name if shown>\",\n'
-                f'    \"source_document\": \"<e.g. Novo Nordisk Pipeline — as of Q1 2025>\",\n'
-                f'    \"phase\": \"<Preclinical / Phase 1 / Phase 2 / Phase 3 / Filed / Approved>\",\n'
-                f'    \"source_url\": \"<URL to the pipeline page>\",\n'
-                f'    \"detail\": \"<any additional status note from the pipeline>\"\n'
+                f'    "indication": "<disease or condition>",\n'
+                f'    "brand_name": "<brand name if shown>",\n'
+                f'    "source_document": "<e.g. Novo Nordisk Pipeline — as of Q1 2025>",\n'
+                f'    "phase": "<Preclinical / Phase 1 / Phase 2 / Phase 3 / Filed / Approved>",\n'
+                f'    "source_url": "<URL to the pipeline page>",\n'
+                f'    "detail": "<any additional status note from the pipeline>",\n'
+                f'    "rationale": "<why this indication was identified — cite the pipeline entry>"\n'
                 f"  }}\n"
                 f"]}}\n\n"
                 f"IMPORTANT:\n"
@@ -226,14 +234,15 @@ def _build_queries(molecule: str, company: str) -> list[dict]:
                 f"in these filings, return a separate entry.\n\n"
                 f"{SECONDARY_INDICATION_CRITERIA}\n"
                 f"Return ONLY valid JSON:\n"
-                f'{{\"entries\": [\n'
+                f'{{"entries": [\n'
                 f'  {{\n'
-                f'    \"indication\": \"<disease or condition>\",\n'
-                f'    \"brand_name\": \"<brand name if mentioned>\",\n'
-                f'    \"source_document\": \"<exact filing type and period, e.g. {company} 10-K FY2024, {company} 8-K dated 2024-03-15>\",\n'
-                f'    \"phase\": \"<Phase 1 / Phase 2 / Phase 3 / Filed / Approved / Launched>\",\n'
-                f'    \"source_url\": \"<URL to the SEC EDGAR filing or press release>\",\n'
-                f'    \"detail\": \"<specific disclosed data: trial outcome, milestone, risk factor, MD&A discussion>\"\n'
+                f'    "indication": "<disease or condition>",\n'
+                f'    "brand_name": "<brand name if mentioned>",\n'
+                f'    "source_document": "<exact filing type and period, e.g. {company} 10-K FY2024, {company} 8-K dated 2024-03-15>",\n'
+                f'    "phase": "<Phase 1 / Phase 2 / Phase 3 / Filed / Approved / Launched>",\n'
+                f'    "source_url": "<URL to the SEC EDGAR filing or press release>",\n'
+                f'    "detail": "<specific disclosed data: trial outcome, milestone, risk factor, MD&A discussion>",\n'
+                f'    "rationale": "<why this indication was identified — cite the filing section and data>"\n'
                 f"  }}\n"
                 f"]}}\n\n"
                 f"IMPORTANT:\n"
@@ -250,77 +259,102 @@ def _build_queries(molecule: str, company: str) -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  STEP 3 — Run research + build rows
+#  STEP 3 — Run research + build rows (PARALLELIZED)
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _research_single_source(q, molecule, company):
+    """Query a single innovator source type. Returns list of row dicts."""
+    source_type = q["source_type"]
+    prompt      = q["prompt"]
+    rows = []
+    print(f"\n  🔍 {source_type}…")
+
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0,
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                system_instruction=(
+                    "You are a pharmaceutical analyst researching what the "
+                    "innovator company publicly says about this drug. "
+                    "Search the web and SEC EDGAR. Return ONLY valid JSON — no markdown, "
+                    "no explanation, no commentary. "
+                    "Apply strict secondary indication criteria: only include indications "
+                    "with documented, verifiable clinical outcomes."
+                ),
+            ),
+        )
+
+        text = response.text.strip()
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+        data    = json.loads(text)
+        entries = data.get("entries", [])
+
+        if not entries:
+            print(f"     ⚠️  No entries found")
+            return rows
+
+        print(f"     ✅ {len(entries)} entries")
+
+        for e in entries:
+            raw_indication = e.get("indication", "").strip()
+            if not raw_indication:
+                continue
+
+            std_indication = standardize_indication(raw_indication)
+            if std_indication.lower() in ("error", "n/a", "none", "no indication found"):
+                continue
+
+            ind_type = classify_indication(molecule, std_indication)
+
+            # Build rationale: prefer explicit rationale, fall back to detail
+            rationale = (e.get("rationale") or e.get("detail") or "").strip()
+
+            rows.append({
+                "molecule_name":   molecule.title(),
+                "company_name":    company,
+                "indication":      std_indication,
+                "rationale":       rationale,
+                "indication_type": ind_type,
+                "therapy_area":    get_therapy_area(std_indication),
+                "trial_title":     e.get("source_document", ""),
+                "trial_id":        e.get("brand_name", ""),
+                "phase":           e.get("phase", ""),
+                "source_url":      e.get("source_url", ""),
+                "data_source":     f"Innovator: {source_type}",
+            })
+            print(f"       • {std_indication} ({ind_type}) ← {e.get('source_document', '?')[:50]}")
+
+    except json.JSONDecodeError:
+        print(f"     ⚠️  JSON parse failed — trying fallback")
+        _fallback_extract(molecule, company, source_type, text, rows)
+    except Exception as e:
+        print(f"     ❌ Error: {e}")
+
+    return rows
+
 
 def research_indications(molecule: str, company: str) -> list[dict]:
     queries  = _build_queries(molecule, company)
     all_rows = []
 
-    for q in queries:
-        source_type = q["source_type"]
-        prompt      = q["prompt"]
-        print(f"\n  🔍 {source_type}…")
+    print(f"\n  🚀 Querying {len(queries)} innovator sources in parallel…\n")
 
-        try:
-            response = gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0,
-                    tools=[types.Tool(google_search=types.GoogleSearch())],
-                    system_instruction=(
-                        "You are a pharmaceutical analyst researching what the "
-                        "innovator company publicly says about this drug. "
-                        "Search the web and SEC EDGAR. Return ONLY valid JSON — no markdown, "
-                        "no explanation, no commentary. "
-                        "Apply strict secondary indication criteria: only include indications "
-                        "with documented, verifiable clinical outcomes."
-                    ),
-                ),
-            )
-
-            text = response.text.strip()
-            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
-            data    = json.loads(text)
-            entries = data.get("entries", [])
-
-            if not entries:
-                print(f"     ⚠️  No entries found")
-                continue
-
-            print(f"     ✅ {len(entries)} entries")
-
-            for e in entries:
-                raw_indication = e.get("indication", "").strip()
-                if not raw_indication:
-                    continue
-
-                std_indication = standardize_indication(raw_indication)
-                if std_indication.lower() in ("error", "n/a", "none", "no indication found"):
-                    continue
-
-                ind_type = classify_indication(molecule, std_indication)
-
-                all_rows.append({
-                    "molecule_name":   molecule.title(),
-                    "company_name":    company,
-                    "indication":      std_indication,
-                    "indication_type": ind_type,
-                    "therapy_area":    get_therapy_area(std_indication),
-                    "trial_title":     e.get("source_document", ""),
-                    "trial_id":        e.get("brand_name", ""),
-                    "phase":           e.get("phase", ""),
-                    "source_url":      e.get("source_url", ""),
-                    "data_source":     f"Innovator: {source_type}",
-                })
-                print(f"       • {std_indication} ({ind_type}) ← {e.get('source_document', '?')[:50]}")
-
-        except json.JSONDecodeError:
-            print(f"     ⚠️  JSON parse failed — trying fallback")
-            _fallback_extract(molecule, company, source_type, text, all_rows)
-        except Exception as e:
-            print(f"     ❌ Error: {e}")
+    # ── Parallel source queries ──────────────────────────────────────────
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(_research_single_source, q, molecule, company): q["source_type"]
+            for q in queries
+        }
+        for future in as_completed(futures):
+            source_type = futures[future]
+            try:
+                rows = future.result()
+                all_rows.extend(rows)
+            except Exception as ex:
+                print(f"     ❌ {source_type}: {ex}")
 
     # ── Deduplicate only exact duplicates (same indication + same source doc)
     seen   = set()
@@ -369,6 +403,7 @@ def _fallback_extract(molecule, company, source_type, raw_text, all_rows):
                     "molecule_name":   molecule.title(),
                     "company_name":    company,
                     "indication":      std,
+                    "rationale":       "(extracted from unstructured response via fallback)",
                     "indication_type": classify_indication(molecule, std),
                     "therapy_area":    get_therapy_area(std),
                     "trial_title":     "(extracted from unstructured response)",
@@ -386,9 +421,10 @@ def _fallback_extract(molecule, company, source_type, raw_text, all_rows):
 #  EXCEL — same column format as label.py
 # ══════════════════════════════════════════════════════════════════════════════
 
-HEADERS    = ["molecule_name", "company_name", "indication", "indication_type",
-              "therapy_area", "trial_title", "trial_id", "phase", "source_url", "data_source"]
-COL_WIDTHS = [18, 22, 28, 16, 18, 50, 18, 10, 40, 16]
+HEADERS    = ["molecule_name", "company_name", "indication", "rationale",
+              "indication_type", "therapy_area", "trial_title", "trial_id",
+              "phase", "source_url", "data_source"]
+COL_WIDTHS = [18, 22, 28, 40, 16, 18, 50, 18, 10, 40, 16]
 
 
 def _thin_border():
