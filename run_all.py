@@ -11,8 +11,8 @@ Modules:
          Gemini + Google Search
 
 All sheets use the SAME standardized column format:
-    molecule_name | company_name | indication | indication_type |
-    trial_title   | trial_id     | phase      | source_url      | data_source
+    molecule_name | company_name | indication | rationale | indication_type |
+    therapy_area  | trial_title  | trial_id   | phase     | source_url      | data_source
 
 Indications are standardized and classified as Primary or Secondary.
 Each row has exactly ONE indication (multi-indication trials are unnested).
@@ -29,6 +29,8 @@ import json
 import time
 import argparse
 import requests
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
 
@@ -57,42 +59,23 @@ GEMINI_API_URL = (
     "gemini-2.5-flash:generateContent"
 )
 
+# ── Parallel config ───────────────────────────────────────────────────────────
+MAX_WORKERS_TRIALS    = 10   # parallel Gemini calls for clinical trial enrichment
+MAX_WORKERS_INNOVATOR = 5    # parallel Gemini calls for innovator source queries
+
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECONDARY INDICATION CRITERIA PROMPT
-# ══════════════════════════════════════════════════════════════════════════════
-
-SECONDARY_INDICATION_CRITERIA = """
-You must extract ONLY secondary indications. Do NOT include the primary indication.
-
-A secondary indication qualifies ONLY if ALL of the following are true:
-
-- The indication represents a true expansion — i.e., it is not part of the primary indication (for clinical assets) or currently approved label (for commercial assets)
-- The indication is described at a clear disease-level definition, avoiding vague, overlapping, or synonymous representations
-- The source must describe observed or measured outcomes in that specific indication (e.g., trial results, endpoint readouts, biomarker response), not just planned evaluation or exploratory intent
-
-The following must NOT be considered secondary indications:
-* Indications mentioned only as hypothesis, targets, or exploratory possibilities
-* Pipeline indications without any data or outcomes
-* Mechanism based assumptions without clinical or empirical validation
-* Early discovery or preclinical signals without human data
-* Any indication lacking traceable, verifiable evidence of results
-
-If no indication meets these criteria, return an empty list [].
-"""
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 #  COMMON FORMAT — all sheets share these columns
 # ══════════════════════════════════════════════════════════════════════════════
 
-HEADERS    = ["molecule_name", "company_name", "indication", "indication_type",
-              "therapy_area", "trial_title", "trial_id", "phase", "source_url", "data_source"]
-COL_WIDTHS = [18, 22, 28, 16, 18, 50, 18, 10, 40, 16]
+HEADERS    = ["molecule_name", "company_name", "indication", "rationale",
+              "indication_type", "therapy_area", "trial_title", "trial_id",
+              "phase", "source_url", "data_source"]
+COL_WIDTHS = [18, 22, 28, 40, 16, 18, 50, 18, 10, 40, 16]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -143,33 +126,19 @@ def save_checkpoint(path: str, data: dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  GEMINI ENRICHMENT (clinical trials)
+#  GEMINI ENRICHMENT (clinical trials) — PARALLELIZED
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _gemini_enrich_trials(rows: list[dict], molecule_name: str,
-                          checkpoint_prefix: str, data_source_label: str) -> list[dict]:
-    from google import genai
-    from google.genai import types
+def _enrich_single_trial(row, molecule_name, client, gen_types, checkpoint, cp_file, cp_lock):
+    """Enrich a single trial. Returns (trial_id, conditions, trial_title, row)."""
+    trial_id = row.get("trial_id")
 
-    client  = genai.Client(api_key=GEMINI_API_KEY)
-    total   = len(rows)
-    cp_file = f"checkpoint_{checkpoint_prefix}_{molecule_name.lower().replace(' ', '_')}.json"
-    cp      = load_checkpoint(cp_file)
+    with cp_lock:
+        if trial_id in checkpoint:
+            data = checkpoint[trial_id]
+            return (trial_id, data["conditions"], data["trial_title"], row)
 
-    print(f"  📁 Checkpoint: {len(cp)} completed rows\n")
-
-    flat = []
-    for i, row in enumerate(rows, 1):
-        trial_id = row.get("trial_id")
-        print(f"  [{i}/{total}] {trial_id}")
-
-        if trial_id in cp:
-            data = cp[trial_id]
-            conditions  = data["conditions"]
-            trial_title = data["trial_title"]
-            print("     ⏭ skipped (checkpoint)")
-        else:
-            prompt = f"""
+    prompt = f"""
 You are a clinical trial data assistant.
 
 Trial details:
@@ -179,55 +148,158 @@ Trial ID: {trial_id}
 Phase:    {row.get('phase')}
 Source URL: {row.get('source_url')}
 
-{SECONDARY_INDICATION_CRITERIA}
+Your task: Extract ALL disease indications being studied in this clinical trial.
+Include BOTH the primary indication AND any secondary/exploratory indications that have documented outcomes.
+
+Look at the trial title, trial ID, source URL, and any available information to identify every
+disease or condition this trial is investigating.
+
+Common patterns to look for:
+- The trial title often contains the indication (e.g., "cardiovascular outcomes" → CV Risk Reduction)
+- "in subjects with type 2 diabetes" → T2DM
+- Trial acronyms like PIONEER, SUSTAIN, STEP, SELECT often indicate specific conditions
+- Outcome studies (e.g., cardiovascular, renal) count as indications
 
 Return ONLY valid JSON:
 {{
-  "conditions": ["secondary_indication_1", "secondary_indication_2"],
+  "conditions": [
+    {{"indication": "<disease or condition>", "rationale": "<why this indication was identified — cite the specific evidence from trial title, ID, or known trial data>"}},
+    {{"indication": "<disease or condition>", "rationale": "<why>"}}
+  ],
   "trial_title": "<trial title>"
 }}
 
 Rules:
-- Return ONLY secondary indications in the conditions list — do NOT include the primary indication
-- If no secondary indications qualify, return: {{"conditions": [], "trial_title": "<trial title>"}}
-- No explanations, only JSON
+- Include ALL indications the trial is evaluating — both primary and secondary
+- Always extract at least the primary indication from the trial title/details
+- Each indication must have a rationale explaining what evidence led to its identification
+- If the trial title mentions a condition (e.g., "type 2 diabetes", "cardiovascular outcomes"), that IS an indication — extract it
+- No explanations outside the JSON
 """
-            try:
-                resp = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0,
-                        system_instruction="Return ONLY valid JSON output",
-                    ),
-                )
-                text = resp.text.strip()
-                text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
-                data = json.loads(text)
-                conditions  = data.get("conditions", [])
-                trial_title = data.get("trial_title", "N/A")
-                if isinstance(conditions, list):
-                    conditions = list(set(c.strip() for c in conditions))
-                else:
-                    conditions = [str(conditions)]
-                print(f"     ✅ {', '.join(conditions)}")
-                cp[trial_id] = {"conditions": conditions, "trial_title": trial_title}
-                save_checkpoint(cp_file, cp)
-            except Exception as e:
-                conditions  = ["Error"]
-                trial_title = str(e)
-                print(f"     ❌ {e}")
+    try:
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=gen_types.GenerateContentConfig(
+                temperature=0,
+                system_instruction="Return ONLY valid JSON output",
+            ),
+        )
+        text = resp.text.strip()
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+        data = json.loads(text)
+        conditions  = data.get("conditions", [])
+        trial_title = data.get("trial_title", "N/A")
 
-        # ── Standardize + classify + unnest ──────────────────────────────
-        processed = process_indications(molecule_name, conditions)
+        # Normalize to list of dicts
+        if isinstance(conditions, list):
+            normalized = []
+            for c in conditions:
+                if isinstance(c, dict):
+                    normalized.append({
+                        "indication": (c.get("indication") or "").strip(),
+                        "rationale": (c.get("rationale") or "").strip(),
+                    })
+                elif isinstance(c, str) and c.strip():
+                    normalized.append({"indication": c.strip(), "rationale": ""})
+            conditions = normalized
+        else:
+            conditions = [{"indication": str(conditions), "rationale": ""}]
+
+        # Deduplicate by indication
+        seen, deduped = set(), []
+        for c in conditions:
+            key = c["indication"].lower()
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append(c)
+        conditions = deduped
+
+        print(f"     ✅ {trial_id}: {', '.join(c['indication'] for c in conditions)}")
+        with cp_lock:
+            checkpoint[trial_id] = {"conditions": conditions, "trial_title": trial_title}
+            save_checkpoint(cp_file, checkpoint)
+
+    except Exception as e:
+        conditions  = []
+        trial_title = str(e)
+        print(f"     ❌ {trial_id}: {e}")
+
+    return (trial_id, conditions, trial_title, row)
+
+
+def _gemini_enrich_trials(rows: list[dict], molecule_name: str,
+                          checkpoint_prefix: str, data_source_label: str) -> list[dict]:
+    from google import genai
+    from google.genai import types as gen_types
+
+    client  = genai.Client(api_key=GEMINI_API_KEY)
+    total   = len(rows)
+    cp_file = f"checkpoint_{checkpoint_prefix}_{molecule_name.lower().replace(' ', '_')}.json"
+    cp      = load_checkpoint(cp_file)
+    cp_lock = threading.Lock()
+
+    print(f"  📁 Checkpoint: {len(cp)} completed rows")
+    print(f"  🚀 Processing {total} trials with {MAX_WORKERS_TRIALS} parallel workers…\n")
+
+    # ── Parallel enrichment ──────────────────────────────────────────────
+    results = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_TRIALS) as executor:
+        futures = {
+            executor.submit(
+                _enrich_single_trial, row, molecule_name, client, gen_types, cp, cp_file, cp_lock
+            ): i
+            for i, row in enumerate(rows)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                results.append(future.result())
+            except Exception as e:
+                row = rows[idx]
+                print(f"     ❌ Unexpected: {row.get('trial_id')}: {e}")
+                results.append((row.get("trial_id"), [], str(e), row))
+
+    # ── Sort by original order ───────────────────────────────────────────
+    trial_order = {row.get("trial_id"): i for i, row in enumerate(rows)}
+    results.sort(key=lambda r: trial_order.get(r[0], 0))
+
+    # ── Standardize + classify + unnest ──────────────────────────────────
+    flat = []
+    for trial_id, conditions, trial_title, row in results:
+        rationale_map = {}
+        raw_indications = []
+        for c in conditions:
+            if isinstance(c, dict):
+                ind = c.get("indication", "")
+                rat = c.get("rationale", "")
+                if ind:
+                    raw_indications.append(ind)
+                    rationale_map[ind.lower()] = rat
+            elif isinstance(c, str) and c.strip():
+                raw_indications.append(c.strip())
+
+        processed = process_indications(molecule_name, raw_indications)
         if not processed:
             processed = [{"indication": "No indication found", "indication_type": "", "therapy_area": ""}]
 
         for ind in processed:
+            # Resolve rationale: try standardized name, then try matching raw→std
+            rationale = ""
+            ind_name = ind["indication"]
+            if ind_name.lower() in rationale_map:
+                rationale = rationale_map[ind_name.lower()]
+            else:
+                for raw_key, rat in rationale_map.items():
+                    if standardize_indication(raw_key) == ind_name:
+                        rationale = rat
+                        break
+
             flat.append({
                 "molecule_name":   row.get("molecule_name"),
                 "company_name":    row.get("company_name"),
                 "indication":      ind["indication"],
+                "rationale":       rationale,
                 "indication_type": ind["indication_type"],
                 "therapy_area":    ind.get("therapy_area", ""),
                 "trial_title":     trial_title,
@@ -296,9 +368,11 @@ def _build_innovator_queries(molecule: str, company: str) -> list[dict]:
                 f"Search for official FDA prescribing information and EMA SmPC for {molecule} (by {company}).\n"
                 f"For EACH approved indication, return a separate entry.\n\n"
                 f"Return ONLY valid JSON:\n"
-                f'{{\"entries\": [\n'
-                f'  {{\"indication\": \"...\", \"brand_name\": \"...\", \"source_document\": \"<exact label title>\", '
-                f'\"phase\": \"Approved\", \"source_url\": \"...\", \"detail\": \"<approval year, population>\"}}\n'
+                f'{{"entries": [\n'
+                f'  {{"indication": "...", "brand_name": "...", "source_document": "<exact label title>", '
+                f'"phase": "Approved", "source_url": "...", '
+                f'"detail": "<approval year, population, dose>", '
+                f'"rationale": "<why this indication was identified — cite the specific label section or approval>"}}\n'
                 f"]}}\n"
                 f"source_document must be the REAL document title. No explanation, only JSON."
             ),
@@ -308,14 +382,15 @@ def _build_innovator_queries(molecule: str, company: str) -> list[dict]:
             "prompt": (
                 f"Search for {company}'s latest investor presentations, Capital Markets Day slides, "
                 f"R&D day presentations about {molecule}.\n"
-                f"For EACH indication mentioned, return a separate entry.\n\n"
-                f"{SECONDARY_INDICATION_CRITERIA}\n"
+                f"For EACH indication mentioned with documented outcomes, return a separate entry.\n\n"
                 f"Return ONLY valid JSON:\n"
-                f'{{\"entries\": [\n'
-                f'  {{\"indication\": \"...\", \"brand_name\": \"...\", '
-                f'\"source_document\": \"<real presentation title with year>\", '
-                f'\"phase\": \"<Phase 1/2/3/Filed/Approved/Launched>\", '
-                f'\"source_url\": \"...\", \"detail\": \"<specific claim from the presentation>\"}}\n'
+                f'{{"entries": [\n'
+                f'  {{"indication": "...", "brand_name": "...", '
+                f'"source_document": "<real presentation title with year>", '
+                f'"phase": "<Phase 1/2/3/Filed/Approved/Launched>", '
+                f'"source_url": "...", '
+                f'"detail": "<specific claim from the presentation>", '
+                f'"rationale": "<why this indication was identified — cite the specific evidence>"}}\n'
                 f"]}}\n"
                 f"Only include indications with observed outcomes data. No explanation, only JSON."
             ),
@@ -324,14 +399,15 @@ def _build_innovator_queries(molecule: str, company: str) -> list[dict]:
             "source_type": "Press Release",
             "prompt": (
                 f"Search for press releases and earnings call statements from {company} about {molecule}.\n"
-                f"For EACH indication mentioned, return a separate entry.\n\n"
-                f"{SECONDARY_INDICATION_CRITERIA}\n"
+                f"For EACH indication mentioned with documented outcomes, return a separate entry.\n\n"
                 f"Return ONLY valid JSON:\n"
-                f'{{\"entries\": [\n'
-                f'  {{\"indication\": \"...\", \"brand_name\": \"...\", '
-                f'\"source_document\": \"<real press release headline or earnings call date>\", '
-                f'\"phase\": \"<Phase 1/2/3/Filed/Approved>\", '
-                f'\"source_url\": \"...\", \"detail\": \"<key announcement>\"}}\n'
+                f'{{"entries": [\n'
+                f'  {{"indication": "...", "brand_name": "...", '
+                f'"source_document": "<real press release headline or earnings call date>", '
+                f'"phase": "<Phase 1/2/3/Filed/Approved>", '
+                f'"source_url": "...", '
+                f'"detail": "<key announcement>", '
+                f'"rationale": "<why this indication was identified — cite the specific news or data>"}}\n'
                 f"]}}\n"
                 f"Only include indications backed by reported outcomes. No explanation, only JSON."
             ),
@@ -341,13 +417,14 @@ def _build_innovator_queries(molecule: str, company: str) -> list[dict]:
             "prompt": (
                 f"Search for {company}'s official pipeline page listing {molecule}.\n"
                 f"For EACH indication on the pipeline, return a separate entry.\n\n"
-                f"{SECONDARY_INDICATION_CRITERIA}\n"
                 f"Return ONLY valid JSON:\n"
-                f'{{\"entries\": [\n'
-                f'  {{\"indication\": \"...\", \"brand_name\": \"...\", '
-                f'\"source_document\": \"<e.g. {company} Pipeline — Q1 2025>\", '
-                f'\"phase\": \"<Preclinical/Phase 1/2/3/Filed/Approved>\", '
-                f'\"source_url\": \"...\", \"detail\": \"<status note>\"}}\n'
+                f'{{"entries": [\n'
+                f'  {{"indication": "...", "brand_name": "...", '
+                f'"source_document": "<e.g. {company} Pipeline — Q1 2025>", '
+                f'"phase": "<Preclinical/Phase 1/2/3/Filed/Approved>", '
+                f'"source_url": "...", '
+                f'"detail": "<status note>", '
+                f'"rationale": "<why this indication was identified — cite the pipeline entry>"}}\n'
                 f"]}}\n"
                 f"Exclude Preclinical entries (no human data). phase MUST be filled. No explanation, only JSON."
             ),
@@ -361,20 +438,76 @@ def _build_innovator_queries(molecule: str, company: str) -> list[dict]:
                 f"that disclose clinical or regulatory information about {molecule}.\n\n"
                 f"For EACH indication described with actual clinical data or regulatory outcomes "
                 f"in these filings, return a separate entry.\n\n"
-                f"{SECONDARY_INDICATION_CRITERIA}\n"
                 f"Return ONLY valid JSON:\n"
-                f'{{\"entries\": [\n'
-                f'  {{\"indication\": \"...\", \"brand_name\": \"...\", '
-                f'\"source_document\": \"<exact filing type and period, e.g. {company} 10-K FY2024>\", '
-                f'\"phase\": \"<Phase 1/2/3/Filed/Approved/Launched>\", '
-                f'\"source_url\": \"<SEC EDGAR URL>\", '
-                f'\"detail\": \"<specific disclosed data: trial outcome, milestone, MD&A section>\"}}\n'
+                f'{{"entries": [\n'
+                f'  {{"indication": "...", "brand_name": "...", '
+                f'"source_document": "<exact filing type and period, e.g. {company} 10-K FY2024>", '
+                f'"phase": "<Phase 1/2/3/Filed/Approved/Launched>", '
+                f'"source_url": "<SEC EDGAR URL>", '
+                f'"detail": "<specific disclosed data: trial outcome, milestone, MD&A section>", '
+                f'"rationale": "<why this indication was identified — cite the filing section and data>"}}\n'
                 f"]}}\n"
                 f"Only include indications with actual results reported in the filing — "
                 f"not forward-looking statements or boilerplate risk factors. No explanation, only JSON."
             ),
         },
     ]
+
+
+def _research_single_source(q, molecule, company, client, gen_types):
+    """Query a single innovator source. Returns (source_type, rows)."""
+    source_type = q["source_type"]
+    rows = []
+    try:
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=q["prompt"],
+            config=gen_types.GenerateContentConfig(
+                temperature=0,
+                tools=[gen_types.Tool(google_search=gen_types.GoogleSearch())],
+                system_instruction=(
+                    "You are a pharmaceutical analyst researching what the "
+                    "innovator company publicly says about this drug, including SEC filings. "
+                    "Search the web and SEC EDGAR. Return ONLY valid JSON. "
+                    "Include indications with documented, verifiable clinical outcomes."
+                ),
+            ),
+        )
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp.text.strip()).strip()
+        entries = json.loads(text).get("entries", [])
+        if not entries:
+            print(f"     ⚠️  {source_type}: No entries")
+            return (source_type, [])
+        print(f"     ✅ {source_type}: {len(entries)} entries")
+
+        for e in entries:
+            raw = e.get("indication", "").strip()
+            if not raw:
+                continue
+            std = standardize_indication(raw)
+            if std.lower() in ("error", "n/a", "none", "no indication found"):
+                continue
+            # Build rationale: prefer explicit rationale, fall back to detail
+            rationale = (e.get("rationale") or e.get("detail") or "").strip()
+            rows.append({
+                "molecule_name":   molecule.title(),
+                "company_name":    company,
+                "indication":      std,
+                "rationale":       rationale,
+                "indication_type": classify_indication(molecule, std),
+                "therapy_area":    get_therapy_area(std),
+                "trial_title":     e.get("source_document", ""),
+                "trial_id":        e.get("brand_name", ""),
+                "phase":           e.get("phase", ""),
+                "source_url":      e.get("source_url", ""),
+                "data_source":     f"Innovator: {source_type}",
+            })
+    except json.JSONDecodeError:
+        print(f"     ⚠️  {source_type}: JSON parse failed")
+    except Exception as ex:
+        print(f"     ❌ {source_type}: {ex}")
+
+    return (source_type, rows)
 
 
 def _innovator_research(molecule: str, company: str) -> list[dict]:
@@ -385,55 +518,23 @@ def _innovator_research(molecule: str, company: str) -> list[dict]:
     queries  = _build_innovator_queries(molecule, company)
     all_rows = []
 
-    for q in queries:
-        source_type = q["source_type"]
-        print(f"\n  🔍 {source_type}…")
-        try:
-            resp = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=q["prompt"],
-                config=_types.GenerateContentConfig(
-                    temperature=0,
-                    tools=[_types.Tool(google_search=_types.GoogleSearch())],
-                    system_instruction=(
-                        "You are a pharmaceutical analyst researching what the "
-                        "innovator company publicly says about this drug, including SEC filings. "
-                        "Search the web and SEC EDGAR. Return ONLY valid JSON. "
-                        "Apply strict secondary indication criteria: only include indications "
-                        "with documented, verifiable clinical outcomes."
-                    ),
-                ),
-            )
-            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp.text.strip()).strip()
-            entries = json.loads(text).get("entries", [])
-            if not entries:
-                print(f"     ⚠️  No entries")
-                continue
-            print(f"     ✅ {len(entries)} entries")
+    print(f"  🚀 Querying {len(queries)} innovator sources in parallel…\n")
 
-            for e in entries:
-                raw = e.get("indication", "").strip()
-                if not raw:
-                    continue
-                std = standardize_indication(raw)
-                if std.lower() in ("error", "n/a", "none", "no indication found"):
-                    continue
-                all_rows.append({
-                    "molecule_name":   molecule.title(),
-                    "company_name":    company,
-                    "indication":      std,
-                    "indication_type": classify_indication(molecule, std),
-                    "therapy_area":    get_therapy_area(std),
-                    "trial_title":     e.get("source_document", ""),
-                    "trial_id":        e.get("brand_name", ""),
-                    "phase":           e.get("phase", ""),
-                    "source_url":      e.get("source_url", ""),
-                    "data_source":     f"Innovator: {source_type}",
-                })
-        except json.JSONDecodeError:
-            print(f"     ⚠️  JSON parse failed")
-        except Exception as ex:
-            print(f"     ❌ {ex}")
+    # ── Parallel source queries ──────────────────────────────────────────
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_INNOVATOR) as executor:
+        futures = {
+            executor.submit(
+                _research_single_source, q, molecule, company, client, _types
+            ): q["source_type"]
+            for q in queries
+        }
+        for future in as_completed(futures):
+            source_type = futures[future]
+            try:
+                _, rows = future.result()
+                all_rows.extend(rows)
+            except Exception as ex:
+                print(f"     ❌ {source_type}: {ex}")
 
     # dedup only exact same indication + same source doc
     seen, unique = set(), []
@@ -536,11 +637,11 @@ def main():
     if not GEMINI_API_KEY:
         sys.exit("❌  GEMINI_API_KEY not set in .env")
 
-    # ── run all modules ───────────────────────────────────────────────────────
+    # ── run all modules ───────────────────────────────────────────────────
     label_rows      = run_label(molecule)
     indication_rows = run_indication_researcher(molecule, args.company)
 
-    # ── assemble workbook ─────────────────────────────────────────────────────
+    # ── assemble workbook ─────────────────────────────────────────────────
     print(f"\n📊 Writing {out_file}…")
     wb = openpyxl.Workbook()
 
