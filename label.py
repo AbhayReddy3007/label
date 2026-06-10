@@ -14,6 +14,7 @@ import os
 import json
 import re
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from google.cloud import bigquery
 from google.oauth2 import service_account
@@ -39,27 +40,11 @@ GBQ_SERVICE_KEY = os.getenv(
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECONDARY INDICATION CRITERIA
+#  PARALLEL CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-SECONDARY_INDICATION_CRITERIA = """
-You must extract ONLY secondary indications. Do NOT include the primary indication.
+MAX_WORKERS = 10  # parallel Gemini calls — tune based on API rate limits
 
-A secondary indication qualifies ONLY if ALL of the following are true:
-
-- The indication represents a true expansion — i.e., it is not part of the primary indication (for clinical assets) or currently approved label (for commercial assets)
-- The indication is described at a clear disease-level definition, avoiding vague, overlapping, or synonymous representations
-- The source must describe observed or measured outcomes in that specific indication (e.g., trial results, endpoint readouts, biomarker response), not just planned evaluation or exploratory intent
-
-The following must NOT be considered secondary indications:
-* Indications mentioned only as hypothesis, targets, or exploratory possibilities
-* Pipeline indications without any data or outcomes
-* Mechanism based assumptions without clinical or empirical validation
-* Early discovery or preclinical signals without human data
-* Any indication lacking traceable, verifiable evidence of results
-
-If no indication meets these criteria, return an empty list [].
-"""
 
 def _bq_client():
     credentials = service_account.Credentials.from_service_account_file(
@@ -95,24 +80,22 @@ def fetch_rows(molecule_name):
     print(f"✅ Retrieved {len(rows)} rows\n")
     return rows
 
-def enrich_with_gemini(rows, molecule_name):
-    enriched = []
-    total = len(rows)
-    checkpoint_file = f"checkpoint_{molecule_name.lower().replace(' ', '_')}.json"
-    checkpoint = load_checkpoint(checkpoint_file)
-    print(f"📁 Loaded checkpoint → {len(checkpoint)} completed rows\n")
 
-    for i, row in enumerate(rows, start=1):
-        trial_id = row.get("trial_id")
-        print(f"[{i}/{total}] Trial ID: {trial_id}")
+# ══════════════════════════════════════════════════════════════════════════════
+#  GEMINI ENRICHMENT — single trial
+# ══════════════════════════════════════════════════════════════════════════════
 
+def _enrich_single_trial(row, molecule_name, checkpoint, checkpoint_file, cp_lock):
+    """Enrich a single trial with Gemini. Returns (trial_id, conditions_with_rationale, trial_title)."""
+    trial_id = row.get("trial_id")
+
+    # Check checkpoint
+    with cp_lock:
         if trial_id in checkpoint:
             cp = checkpoint[trial_id]
-            conditions = cp["conditions"]
-            trial_title = cp["trial_title"]
-            print("   ⏭️ Skipped (checkpoint)")
-        else:
-            prompt = f"""
+            return (trial_id, cp["conditions"], cp["trial_title"], row)
+
+    prompt = f"""
 You are a clinical trial data assistant.
 
 Trial details:
@@ -122,82 +105,189 @@ Trial ID: {trial_id}
 Phase: {row.get('phase')}
 Source URL: {row.get('source_url')}
 
-{SECONDARY_INDICATION_CRITERIA}
+Your task: Extract ALL disease indications being studied in this clinical trial.
+Include BOTH the primary indication AND any secondary/exploratory indications that have documented outcomes.
+
+Look at the trial title, trial ID, source URL, and any available information to identify every
+disease or condition this trial is investigating.
+
+Common patterns to look for:
+- The trial title often contains the indication (e.g., "cardiovascular outcomes" → CV Risk Reduction)
+- "in subjects with type 2 diabetes" → T2DM
+- Trial acronyms like PIONEER, SUSTAIN, STEP, SELECT often indicate specific conditions
+- Outcome studies (e.g., cardiovascular, renal) count as indications
 
 Return ONLY valid JSON:
 {{
-  "conditions": ["secondary_indication_1", "secondary_indication_2"],
+  "conditions": [
+    {{"indication": "<disease or condition>", "rationale": "<why this indication was identified — cite the specific evidence from trial title, ID, or known trial data>"}},
+    {{"indication": "<disease or condition>", "rationale": "<why>"}}
+  ],
   "trial_title": "<trial title>"
 }}
 
 Rules:
-- Return ONLY secondary indications in the conditions list — do NOT include the primary indication
-- If no secondary indications qualify, return: {{"conditions": [], "trial_title": "<trial title>"}}
-- No explanations, only JSON
+- Include ALL indications the trial is evaluating — both primary and secondary
+- Always extract at least the primary indication from the trial title/details
+- Each indication must have a rationale explaining what evidence led to its identification
+- If the trial title mentions a condition (e.g., "type 2 diabetes", "cardiovascular outcomes"), that IS an indication — extract it
+- No explanations outside the JSON
 """
+    try:
+        import threading
+
+        result_holder = {}
+        error_holder  = {}
+
+        def _call_gemini():
             try:
-                import threading
+                resp = gemini_client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0,
+                        system_instruction="Return ONLY valid JSON output"
+                    ),
+                )
+                result_holder["response"] = resp
+            except Exception as ex:
+                error_holder["error"] = ex
 
-                result_holder = {}
-                error_holder  = {}
+        thread = threading.Thread(target=_call_gemini, daemon=True)
+        thread.start()
+        thread.join(timeout=60)
 
-                def _call_gemini():
-                    try:
-                        resp = gemini_client.models.generate_content(
-                            model="gemini-2.5-flash",
-                            contents=prompt,
-                            config=types.GenerateContentConfig(
-                                temperature=0,
-                                system_instruction="Return ONLY valid JSON output"
-                            ),
-                        )
-                        result_holder["response"] = resp
-                    except Exception as ex:
-                        error_holder["error"] = ex
+        if thread.is_alive():
+            print(f"   ⏱️  Timeout (>60s) — skipping trial {trial_id}")
+            conditions  = []
+            trial_title = "Skipped (timeout)"
+        elif "error" in error_holder:
+            raise error_holder["error"]
+        else:
+            response    = result_holder["response"]
+            text        = response.text.strip()
+            text        = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+            data        = json.loads(text)
+            conditions  = data.get("conditions", [])
+            trial_title = data.get("trial_title", "N/A")
 
-                thread = threading.Thread(target=_call_gemini, daemon=True)
-                thread.start()
-                thread.join(timeout=60)
+            # Handle both old format (list of strings) and new format (list of dicts)
+            if isinstance(conditions, list):
+                normalized = []
+                for c in conditions:
+                    if isinstance(c, dict):
+                        normalized.append({
+                            "indication": (c.get("indication") or "").strip(),
+                            "rationale": (c.get("rationale") or "").strip(),
+                        })
+                    elif isinstance(c, str) and c.strip():
+                        normalized.append({
+                            "indication": c.strip(),
+                            "rationale": "",
+                        })
+                conditions = normalized
+            else:
+                conditions = [{"indication": str(conditions), "rationale": ""}]
 
-                if thread.is_alive():
-                    print(f"   ⏱️  Timeout (>60s) — skipping trial {trial_id}")
-                    conditions  = []
-                    trial_title = "Skipped (timeout)"
-                elif "error" in error_holder:
-                    raise error_holder["error"]
-                else:
-                    response    = result_holder["response"]
-                    text        = response.text.strip()
-                    text        = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
-                    data        = json.loads(text)
-                    conditions  = data.get("conditions", [])
-                    trial_title = data.get("trial_title", "N/A")
-                    if isinstance(conditions, list):
-                        conditions = list(set((c or "").strip() for c in conditions if c))
-                    else:
-                        conditions = [str(conditions)]
-                    print(f"   ✅ {', '.join(conditions) if conditions else 'no secondary indications'}")
-                    checkpoint[trial_id] = {"conditions": conditions, "trial_title": trial_title}
-                    save_checkpoint(checkpoint_file, checkpoint)
+            # Deduplicate by indication name
+            seen = set()
+            deduped = []
+            for c in conditions:
+                key = c["indication"].lower()
+                if key and key not in seen:
+                    seen.add(key)
+                    deduped.append(c)
+            conditions = deduped
 
+            print(f"   ✅ {trial_id}: {', '.join(c['indication'] for c in conditions) if conditions else 'no indications'}")
+
+            with cp_lock:
+                checkpoint[trial_id] = {"conditions": conditions, "trial_title": trial_title}
+                save_checkpoint(checkpoint_file, checkpoint)
+
+    except Exception as e:
+        conditions  = []
+        trial_title = str(e)
+        print(f"   ❌ {trial_id}: {e}")
+
+    return (trial_id, conditions, trial_title, row)
+
+
+def enrich_with_gemini(rows, molecule_name):
+    import threading
+
+    enriched = []
+    total = len(rows)
+    checkpoint_file = f"checkpoint_{molecule_name.lower().replace(' ', '_')}.json"
+    checkpoint = load_checkpoint(checkpoint_file)
+    cp_lock = threading.Lock()
+    print(f"📁 Loaded checkpoint → {len(checkpoint)} completed rows\n")
+    print(f"🚀 Processing {total} trials with {MAX_WORKERS} parallel workers…\n")
+
+    # ── Parallel enrichment ──────────────────────────────────────────────
+    results = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                _enrich_single_trial, row, molecule_name, checkpoint, checkpoint_file, cp_lock
+            ): i
+            for i, row in enumerate(rows)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                results.append(future.result())
             except Exception as e:
-                conditions  = []
-                trial_title = str(e)
-                print(f"   ❌ Error: {e}")
+                row = rows[idx]
+                print(f"   ❌ Unexpected error for {row.get('trial_id')}: {e}")
+                results.append((row.get("trial_id"), [], str(e), row))
 
-        # ── Standardize + classify + unnest (one row per indication) ─────
-        processed = process_indications(molecule_name, conditions)
+    # ── Sort by original order ───────────────────────────────────────────
+    trial_order = {row.get("trial_id"): i for i, row in enumerate(rows)}
+    results.sort(key=lambda r: trial_order.get(r[0], 0))
+
+    # ── Standardize + classify + unnest (one row per indication) ─────────
+    for trial_id, conditions, trial_title, row in results:
+        # Build rationale map before standardization
+        rationale_map = {}
+        raw_indications = []
+        for c in conditions:
+            if isinstance(c, dict):
+                ind = c.get("indication", "")
+                rat = c.get("rationale", "")
+                if ind:
+                    raw_indications.append(ind)
+                    rationale_map[ind.lower()] = rat
+            elif isinstance(c, str) and c.strip():
+                raw_indications.append(c.strip())
+
+        processed = process_indications(molecule_name, raw_indications)
         if not processed:
-            processed = [{"indication": "No indication found", "indication_type": ""}]
+            processed = [{"indication": "No indication found", "indication_type": "", "therapy_area": ""}]
 
         for ind in processed:
+            # Try to find rationale: match standardized back to raw
+            rationale = ""
+            ind_name = ind["indication"]
+            # Direct match on standardized name
+            if ind_name.lower() in rationale_map:
+                rationale = rationale_map[ind_name.lower()]
+            else:
+                # Try matching raw keys that might have been standardized to this name
+                for raw_key, rat in rationale_map.items():
+                    std = standardize_indication(raw_key)
+                    if std == ind_name:
+                        rationale = rat
+                        break
+
             enriched.append({
                 "molecule_name":   row.get("molecule_name"),
                 "company_name":    row.get("company_name"),
                 "indication":      ind["indication"],
+                "rationale":       rationale,
                 "indication_type": ind["indication_type"],
                 "therapy_area":    ind["therapy_area"],
-                "trial_title":     trial_title if 'trial_title' in dir() else cp.get("trial_title", ""),
+                "trial_title":     trial_title,
                 "trial_id":        trial_id,
                 "phase":           row.get("phase"),
                 "source_url":      row.get("source_url"),
@@ -209,9 +299,10 @@ Rules:
 
 
 # ── COMMON FORMAT HEADERS ────────────────────────────────────────────────────
-HEADERS    = ["molecule_name", "company_name", "indication", "indication_type",
-              "therapy_area", "trial_title", "trial_id", "phase", "source_url", "data_source"]
-COL_WIDTHS = [18, 22, 28, 16, 18, 50, 18, 10, 40, 16]
+HEADERS    = ["molecule_name", "company_name", "indication", "rationale",
+              "indication_type", "therapy_area", "trial_title", "trial_id",
+              "phase", "source_url", "data_source"]
+COL_WIDTHS = [18, 22, 28, 40, 16, 18, 50, 18, 10, 40, 16]
 
 
 def _thin_border():
