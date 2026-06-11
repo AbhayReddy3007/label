@@ -1,9 +1,9 @@
 """
 Clinical Efficacy — label.py
 Fetches clinical trial data from BigQuery, enriches with Gemini,
-standardizes indications, classifies primary/secondary.
+LLM-based primary/secondary classification and therapy area assignment.
 
-Output: one indication per row in standardized format.
+Output: one indication per row in standardized format with Ep and Et scores.
 
 Usage:
     python label.py semaglutide
@@ -24,7 +24,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-from indication_standardizer import standardize_indication, classify_indication, process_indications
+from indication_standardizer import standardize_indication
 
 load_dotenv(override=True)
 
@@ -44,6 +44,26 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 # ══════════════════════════════════════════════════════════════════════════════
 
 MAX_WORKERS = 10  # parallel Gemini calls — tune based on API rate limits
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECONDARY INDICATION CRITERIA (from drug_indication_researcher.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+SECONDARY_INDICATION_CRITERIA = """
+A secondary indication qualifies ONLY if ALL of the following are true:
+
+- The indication represents a true expansion — i.e., it is not part of the primary indication (for clinical assets) or currently approved label (for commercial assets)
+- The indication is described at a clear disease-level definition, avoiding vague, overlapping, or synonymous representations
+- The source must describe observed or measured outcomes in that specific indication (e.g., trial results, endpoint readouts, biomarker response), not just planned evaluation or exploratory intent
+
+The following must NOT be considered secondary indications:
+* Indications mentioned only as hypothesis, targets, or exploratory possibilities
+* Pipeline indications without any data or outcomes
+* Mechanism based assumptions without clinical or empirical validation
+* Early discovery or preclinical signals without human data
+* Any indication lacking traceable, verifiable evidence of results
+"""
 
 
 def _bq_client():
@@ -82,11 +102,121 @@ def fetch_rows(molecule_name):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  GEMINI ENRICHMENT — single trial
+#  Ep SCORE — row-wise, based on phase
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_ep(phase) -> str:
+    """
+    Ep score based on clinical trial phase (row-wise).
+    Phase 4 or 3 → 5
+    Phase 2     → 4
+    Phase 1     → 3
+    """
+    phase_str = str(phase).strip().lower() if phase else ""
+    # Extract all numeric phase values from the string
+    nums = re.findall(r'\d+', phase_str)
+    if not nums:
+        # Try keyword matches for "approved" / "launched" (treat as post-phase-3)
+        if any(kw in phase_str for kw in ("approved", "launched", "marketed")):
+            return "5"
+        return ""
+    max_phase = max(int(n) for n in nums)
+    if max_phase >= 3:
+        return "5"
+    elif max_phase == 2:
+        return "4"
+    elif max_phase == 1:
+        return "3"
+    return ""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Et SCORE — drug-level, based on therapy area & indication breadth
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_et(enriched_rows, molecule_name):
+    """
+    Et score computed across all rows for a drug:
+      Multiple therapy areas                              → 5
+      1 therapy area, 2+ secondary indications            → 4
+      1 therapy area, 1 secondary (broad)                 → 3
+      1 therapy area, 1 secondary (very niche)            → 2
+      1 therapy area, primary indication(s) only          → 1
+    """
+    drug_rows = [r for r in enriched_rows
+                 if r.get("molecule_name", "").lower() == molecule_name.lower()]
+    if not drug_rows:
+        return ""
+
+    therapy_areas = set(
+        r["therapy_area"] for r in drug_rows
+        if r.get("therapy_area") and r["therapy_area"].lower() not in ("other", "")
+    )
+    secondary_indications = list(set(
+        r["indication"] for r in drug_rows
+        if r.get("indication_type", "").lower() == "secondary"
+    ))
+    primary_indications = list(set(
+        r["indication"] for r in drug_rows
+        if r.get("indication_type", "").lower() == "primary"
+    ))
+
+    if len(therapy_areas) > 1:
+        return "5"
+    elif len(secondary_indications) >= 2:
+        return "4"
+    elif len(secondary_indications) == 1:
+        # Ask LLM whether this single secondary indication is very niche
+        is_niche = _check_niche(molecule_name, primary_indications, secondary_indications[0])
+        return "2" if is_niche else "3"
+    else:
+        return "1"
+
+
+def _check_niche(molecule, primary_list, secondary_indication):
+    """Use Gemini to determine if a single secondary indication is very niche."""
+    primary_str = ", ".join(primary_list) if primary_list else "unknown"
+    prompt = f"""
+You are a pharmaceutical analyst.
+
+Drug: {molecule}
+Primary indication(s): {primary_str}
+Secondary (label expansion) indication: {secondary_indication}
+
+Is this label expansion "very niche"?
+A label expansion is "very niche" if it targets a narrow, specialized patient
+sub-population, a rare disease, an orphan indication, or a highly specific
+clinical context that affects relatively few patients compared to the primary
+indication.
+
+Return ONLY valid JSON:
+{{"is_niche": true}} or {{"is_niche": false}}
+No explanation.
+"""
+    try:
+        resp = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0,
+                system_instruction="Return ONLY valid JSON.",
+            ),
+        )
+        text = resp.text.strip()
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+        data = json.loads(text)
+        return data.get("is_niche", False)
+    except Exception as e:
+        print(f"   ⚠️  Niche check failed: {e} — defaulting to non-niche")
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GEMINI ENRICHMENT — single trial (LLM-based classification)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _enrich_single_trial(row, molecule_name, checkpoint, checkpoint_file, cp_lock):
-    """Enrich a single trial with Gemini. Returns (trial_id, conditions_with_rationale, trial_title)."""
+    """Enrich a single trial with Gemini. Returns (trial_id, conditions, trial_title, row)."""
     trial_id = row.get("trial_id")
 
     # Check checkpoint
@@ -96,7 +226,7 @@ def _enrich_single_trial(row, molecule_name, checkpoint, checkpoint_file, cp_loc
             return (trial_id, cp["conditions"], cp["trial_title"], row)
 
     prompt = f"""
-You are a clinical trial data assistant.
+You are a clinical trial data assistant and pharmaceutical analyst.
 
 Trial details:
 Molecule: {row.get('molecule_name')}
@@ -105,13 +235,28 @@ Trial ID: {trial_id}
 Phase: {row.get('phase')}
 Source URL: {row.get('source_url')}
 
-Your task: Extract ALL disease indications being studied in this clinical trial.
-Include BOTH the primary indication AND any secondary/exploratory indications that have documented outcomes.
+Your task:
+1. Extract ALL disease indications being studied in this clinical trial.
+2. Classify each indication as "Primary" or "Secondary".
+3. Assign a therapy_area to each indication.
 
-Look at the trial title, trial ID, source URL, and any available information to identify every
-disease or condition this trial is investigating.
+=== CLASSIFICATION RULES ===
 
-Common patterns to look for:
+"Primary" indication:
+- The drug's main approved or originally intended indication
+- The core disease the drug was designed and initially developed to treat
+- What appears on the original FDA/EMA approved label
+
+"Secondary" indication — must meet ALL of the following criteria:
+{SECONDARY_INDICATION_CRITERIA}
+
+=== THERAPY AREA ===
+Assign one of: Metabolic, Cardiovascular, Oncology, Neuroscience, Immunology,
+Respiratory, Nephrology, Hepatology, Ophthalmology, Musculoskeletal,
+Gastroenterology, Infectious Disease, Dermatology, Hematology, Rare Disease,
+or another appropriate broad therapeutic area.
+
+=== PATTERNS TO LOOK FOR ===
 - The trial title often contains the indication (e.g., "cardiovascular outcomes" → CV Risk Reduction)
 - "in subjects with type 2 diabetes" → T2DM
 - Trial acronyms like PIONEER, SUSTAIN, STEP, SELECT often indicate specific conditions
@@ -120,8 +265,12 @@ Common patterns to look for:
 Return ONLY valid JSON:
 {{
   "conditions": [
-    {{"indication": "<disease or condition>", "rationale": "<why this indication was identified — cite the specific evidence from trial title, ID, or known trial data>"}},
-    {{"indication": "<disease or condition>", "rationale": "<why>"}}
+    {{
+      "indication": "<disease or condition>",
+      "indication_type": "Primary" or "Secondary",
+      "therapy_area": "<broad therapeutic area>",
+      "rationale": "<why this indication was identified — cite the specific evidence>"
+    }}
   ],
   "trial_title": "<trial title>"
 }}
@@ -129,8 +278,7 @@ Return ONLY valid JSON:
 Rules:
 - Include ALL indications the trial is evaluating — both primary and secondary
 - Always extract at least the primary indication from the trial title/details
-- Each indication must have a rationale explaining what evidence led to its identification
-- If the trial title mentions a condition (e.g., "type 2 diabetes", "cardiovascular outcomes"), that IS an indication — extract it
+- Each indication must have indication_type, therapy_area, and rationale
 - No explanations outside the JSON
 """
     try:
@@ -171,23 +319,28 @@ Rules:
             conditions  = data.get("conditions", [])
             trial_title = data.get("trial_title", "N/A")
 
-            # Handle both old format (list of strings) and new format (list of dicts)
+            # Normalize to list of dicts with all required fields
             if isinstance(conditions, list):
                 normalized = []
                 for c in conditions:
                     if isinstance(c, dict):
                         normalized.append({
-                            "indication": (c.get("indication") or "").strip(),
-                            "rationale": (c.get("rationale") or "").strip(),
+                            "indication":      (c.get("indication") or "").strip(),
+                            "indication_type": (c.get("indication_type") or "Secondary").strip(),
+                            "therapy_area":    (c.get("therapy_area") or "Other").strip(),
+                            "rationale":       (c.get("rationale") or "").strip(),
                         })
                     elif isinstance(c, str) and c.strip():
                         normalized.append({
-                            "indication": c.strip(),
-                            "rationale": "",
+                            "indication":      c.strip(),
+                            "indication_type": "Secondary",
+                            "therapy_area":    "Other",
+                            "rationale":       "",
                         })
                 conditions = normalized
             else:
-                conditions = [{"indication": str(conditions), "rationale": ""}]
+                conditions = [{"indication": str(conditions), "indication_type": "Secondary",
+                               "therapy_area": "Other", "rationale": ""}]
 
             # Deduplicate by indication name
             seen = set()
@@ -199,7 +352,7 @@ Rules:
                     deduped.append(c)
             conditions = deduped
 
-            print(f"   ✅ {trial_id}: {', '.join(c['indication'] for c in conditions) if conditions else 'no indications'}")
+            print(f"   ✅ {trial_id}: {', '.join(c['indication'] + ' (' + c['indication_type'] + ')' for c in conditions) if conditions else 'no indications'}")
 
             with cp_lock:
                 checkpoint[trial_id] = {"conditions": conditions, "trial_title": trial_title}
@@ -246,47 +399,45 @@ def enrich_with_gemini(rows, molecule_name):
     trial_order = {row.get("trial_id"): i for i, row in enumerate(rows)}
     results.sort(key=lambda r: trial_order.get(r[0], 0))
 
-    # ── Standardize + classify + unnest (one row per indication) ─────────
+    # ── Unnest (one row per indication), use LLM classification ──────────
     for trial_id, conditions, trial_title, row in results:
-        # Build rationale map before standardization
-        rationale_map = {}
-        raw_indications = []
+        if not conditions:
+            enriched.append({
+                "molecule_name":   row.get("molecule_name"),
+                "company_name":    row.get("company_name"),
+                "indication":      "No indication found",
+                "rationale":       "",
+                "indication_type": "",
+                "therapy_area":    "",
+                "trial_title":     trial_title,
+                "trial_id":        trial_id,
+                "phase":           row.get("phase"),
+                "source_url":      row.get("source_url"),
+                "data_source":     "Clinical Trials",
+            })
+            continue
+
+        seen = set()
         for c in conditions:
-            if isinstance(c, dict):
-                ind = c.get("indication", "")
-                rat = c.get("rationale", "")
-                if ind:
-                    raw_indications.append(ind)
-                    rationale_map[ind.lower()] = rat
-            elif isinstance(c, str) and c.strip():
-                raw_indications.append(c.strip())
+            raw_indication = c.get("indication", "")
+            if not raw_indication:
+                continue
 
-        processed = process_indications(molecule_name, raw_indications)
-        if not processed:
-            processed = [{"indication": "No indication found", "indication_type": "", "therapy_area": ""}]
-
-        for ind in processed:
-            # Try to find rationale: match standardized back to raw
-            rationale = ""
-            ind_name = ind["indication"]
-            # Direct match on standardized name
-            if ind_name.lower() in rationale_map:
-                rationale = rationale_map[ind_name.lower()]
-            else:
-                # Try matching raw keys that might have been standardized to this name
-                for raw_key, rat in rationale_map.items():
-                    std = standardize_indication(raw_key)
-                    if std == ind_name:
-                        rationale = rat
-                        break
+            # Light normalization via standardize_indication (keeps names clean)
+            std = standardize_indication(raw_indication)
+            if not std or std.lower() in ("error", "n/a", "no indication found", "none"):
+                continue
+            if std.lower() in seen:
+                continue
+            seen.add(std.lower())
 
             enriched.append({
                 "molecule_name":   row.get("molecule_name"),
                 "company_name":    row.get("company_name"),
-                "indication":      ind["indication"],
-                "rationale":       rationale,
-                "indication_type": ind["indication_type"],
-                "therapy_area":    ind["therapy_area"],
+                "indication":      std,
+                "rationale":       c.get("rationale", ""),
+                "indication_type": c.get("indication_type", "Secondary"),
+                "therapy_area":    c.get("therapy_area", "Other"),
                 "trial_title":     trial_title,
                 "trial_id":        trial_id,
                 "phase":           row.get("phase"),
@@ -294,15 +445,26 @@ def enrich_with_gemini(rows, molecule_name):
                 "data_source":     "Clinical Trials",
             })
 
-    print(f"\n✅ Completed. {len(enriched)} rows (unnested, standardized)\n")
+    # ── Compute Ep (row-wise) ────────────────────────────────────────────
+    for row in enriched:
+        row["Ep"] = compute_ep(row.get("phase"))
+
+    # ── Compute Et (drug-level) ──────────────────────────────────────────
+    print("🔹 Computing Et (drug-level expansion score)...")
+    et_value = compute_et(enriched, molecule_name)
+    for row in enriched:
+        row["Et"] = et_value
+    print(f"   Et = {et_value}")
+
+    print(f"\n✅ Completed. {len(enriched)} rows (unnested, LLM-classified)\n")
     return enriched
 
 
 # ── COMMON FORMAT HEADERS ────────────────────────────────────────────────────
 HEADERS    = ["molecule_name", "company_name", "indication", "rationale",
               "indication_type", "therapy_area", "trial_title", "trial_id",
-              "phase", "source_url", "data_source"]
-COL_WIDTHS = [18, 22, 28, 40, 16, 18, 50, 18, 10, 40, 16]
+              "phase", "source_url", "data_source", "Ep", "Et"]
+COL_WIDTHS = [18, 22, 28, 40, 16, 18, 50, 18, 10, 40, 16, 8, 8]
 
 
 def _thin_border():
