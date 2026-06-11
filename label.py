@@ -1,9 +1,10 @@
 """
 Clinical Efficacy — label.py
 Fetches clinical trial data from BigQuery, enriches with Gemini,
-LLM-based primary/secondary classification and therapy area assignment.
+then uses a SEPARATE Gemini + Google Search call to classify
+indications as Primary / Secondary and assign therapy areas.
 
-Output: one indication per row in standardized format with Ep and Et scores.
+Output: one indication per row with Ep and Et scores.
 
 Usage:
     python label.py semaglutide
@@ -43,19 +44,24 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 #  PARALLEL CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-MAX_WORKERS = 10  # parallel Gemini calls — tune based on API rate limits
+MAX_WORKERS = 10
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECONDARY INDICATION CRITERIA (from drug_indication_researcher.py)
+#  SECONDARY INDICATION CRITERIA
 # ══════════════════════════════════════════════════════════════════════════════
 
 SECONDARY_INDICATION_CRITERIA = """
 A secondary indication qualifies ONLY if ALL of the following are true:
 
-- The indication represents a true expansion — i.e., it is not part of the primary indication (for clinical assets) or currently approved label (for commercial assets)
-- The indication is described at a clear disease-level definition, avoiding vague, overlapping, or synonymous representations
-- The source must describe observed or measured outcomes in that specific indication (e.g., trial results, endpoint readouts, biomarker response), not just planned evaluation or exploratory intent
+- The indication represents a true expansion — i.e., it is not part of the
+  primary indication (for clinical assets) or currently approved label
+  (for commercial assets)
+- The indication is described at a clear disease-level definition, avoiding
+  vague, overlapping, or synonymous representations
+- The source must describe observed or measured outcomes in that specific
+  indication (e.g., trial results, endpoint readouts, biomarker response),
+  not just planned evaluation or exploratory intent
 
 The following must NOT be considered secondary indications:
 * Indications mentioned only as hypothesis, targets, or exploratory possibilities
@@ -102,21 +108,138 @@ def fetch_rows(molecule_name):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  LLM CLASSIFICATION — one call per drug, with Google Search grounding
+# ══════════════════════════════════════════════════════════════════════════════
+
+def classify_indications_with_llm(molecule_name, unique_indications):
+    """
+    Uses Gemini + Google Search to research the drug and classify each
+    indication as Primary / Secondary, and assign therapy areas.
+
+    Returns dict:  indication_name → {"indication_type": ..., "therapy_area": ...}
+    """
+    if not unique_indications:
+        return {}
+
+    indications_json = json.dumps(unique_indications, indent=2)
+
+    prompt = f"""
+You are a pharmaceutical analyst. Your task is to research the drug
+"{molecule_name}" and classify each of the following indications.
+
+Drug / Molecule: {molecule_name}
+
+Indications to classify:
+{indications_json}
+
+═══ STEP 1 — Research the drug ═══
+Search the web to find:
+  • What "{molecule_name}" is primarily approved / developed for
+  • The FDA / EMA approved labels for this drug
+  • The originator company's pipeline and clinical development programs
+
+═══ STEP 2 — Classify each indication ═══
+For EACH indication in the list above:
+
+  indication_type:
+    "Primary"   — this IS one of the drug's main approved or originally
+                   intended indications (what it was designed and first
+                   developed / approved to treat).
+    "Secondary" — this is a label expansion or additional indication
+                   beyond the primary use.
+                   {SECONDARY_INDICATION_CRITERIA}
+
+  therapy_area:
+    Look at the INDICATION itself (the disease / condition) and determine
+    which medical specialty treats it.
+    Choose from: Metabolic, Cardiovascular, Oncology, Neuroscience,
+    Immunology, Respiratory, Nephrology, Hepatology, Ophthalmology,
+    Musculoskeletal, Gastroenterology, Infectious Disease, Dermatology,
+    Hematology, Endocrinology, Rare Disease, or another appropriate
+    broad therapeutic area.
+
+    Examples:
+      T2DM / Type 2 Diabetes / Obesity → Metabolic
+      Heart Failure / MACE / CV Risk Reduction → Cardiovascular
+      CKD / Diabetic Kidney Disease → Nephrology
+      NASH / MASH → Hepatology
+      NSCLC / Breast Cancer → Oncology
+      Alzheimer's Disease → Neuroscience
+      Rheumatoid Arthritis / Psoriasis → Immunology
+      COPD / Asthma → Respiratory
+      OSA (Obstructive Sleep Apnea) → Respiratory
+
+Return ONLY valid JSON — no markdown fences, no explanation:
+{{
+  "classifications": [
+    {{
+      "indication": "<exact indication name from input list>",
+      "indication_type": "Primary" or "Secondary",
+      "therapy_area": "<therapy area>"
+    }}
+  ]
+}}
+"""
+
+    print(f"🔹 Classifying {len(unique_indications)} unique indications for {molecule_name} (LLM + Search)…")
+    try:
+        resp = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0,
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                system_instruction=(
+                    "You are a pharmaceutical analyst. "
+                    "Search the web to find what this drug is approved for. "
+                    "Return ONLY valid JSON — no markdown, no explanation."
+                ),
+            ),
+        )
+        text = resp.text.strip()
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+        data = json.loads(text)
+        classifications = data.get("classifications", [])
+
+        result = {}
+        for c in classifications:
+            name = c.get("indication", "").strip()
+            if name:
+                result[name.lower()] = {
+                    "indication_type": c.get("indication_type", "Secondary"),
+                    "therapy_area":    c.get("therapy_area", "Other"),
+                }
+                print(f"   • {name}: {c.get('indication_type')} | {c.get('therapy_area')}")
+
+        # Fill in any missing indications with defaults
+        for ind in unique_indications:
+            if ind.lower() not in result:
+                print(f"   ⚠️  Missing classification for '{ind}' — defaulting to Secondary / Other")
+                result[ind.lower()] = {
+                    "indication_type": "Secondary",
+                    "therapy_area":    "Other",
+                }
+
+        return result
+
+    except Exception as e:
+        print(f"   ❌ Classification failed: {e}")
+        # Return defaults for everything
+        return {
+            ind.lower(): {"indication_type": "Secondary", "therapy_area": "Other"}
+            for ind in unique_indications
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Ep SCORE — row-wise, based on phase
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_ep(phase) -> str:
-    """
-    Ep score based on clinical trial phase (row-wise).
-    Phase 4 or 3 → 5
-    Phase 2     → 4
-    Phase 1     → 3
-    """
+    """Phase 4 or 3 → 5, Phase 2 → 4, Phase 1 → 3."""
     phase_str = str(phase).strip().lower() if phase else ""
-    # Extract all numeric phase values from the string
     nums = re.findall(r'\d+', phase_str)
     if not nums:
-        # Try keyword matches for "approved" / "launched" (treat as post-phase-3)
         if any(kw in phase_str for kw in ("approved", "launched", "marketed")):
             return "5"
         return ""
@@ -131,17 +254,16 @@ def compute_ep(phase) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Et SCORE — drug-level, based on therapy area & indication breadth
+#  Et SCORE — drug-level
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_et(enriched_rows, molecule_name):
     """
-    Et score computed across all rows for a drug:
-      Multiple therapy areas                              → 5
-      1 therapy area, 2+ secondary indications            → 4
-      1 therapy area, 1 secondary (broad)                 → 3
-      1 therapy area, 1 secondary (very niche)            → 2
-      1 therapy area, primary indication(s) only          → 1
+    Multiple therapy areas                              → 5
+    1 therapy area, 2+ secondary indications            → 4
+    1 therapy area, 1 secondary (broad)                 → 3
+    1 therapy area, 1 secondary (very niche)            → 2
+    1 therapy area, primary indication(s) only          → 1
     """
     drug_rows = [r for r in enriched_rows
                  if r.get("molecule_name", "").lower() == molecule_name.lower()]
@@ -166,15 +288,15 @@ def compute_et(enriched_rows, molecule_name):
     elif len(secondary_indications) >= 2:
         return "4"
     elif len(secondary_indications) == 1:
-        # Ask LLM whether this single secondary indication is very niche
-        is_niche = _check_niche(molecule_name, primary_indications, secondary_indications[0])
+        is_niche = _check_niche(molecule_name, primary_indications,
+                                secondary_indications[0])
         return "2" if is_niche else "3"
     else:
         return "1"
 
 
 def _check_niche(molecule, primary_list, secondary_indication):
-    """Use Gemini to determine if a single secondary indication is very niche."""
+    """Use Gemini + Search to determine if a secondary indication is very niche."""
     primary_str = ", ".join(primary_list) if primary_list else "unknown"
     prompt = f"""
 You are a pharmaceutical analyst.
@@ -189,6 +311,9 @@ sub-population, a rare disease, an orphan indication, or a highly specific
 clinical context that affects relatively few patients compared to the primary
 indication.
 
+Search the web to determine the patient population size for this secondary
+indication compared to the primary indication.
+
 Return ONLY valid JSON:
 {{"is_niche": true}} or {{"is_niche": false}}
 No explanation.
@@ -199,6 +324,7 @@ No explanation.
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0,
+                tools=[types.Tool(google_search=types.GoogleSearch())],
                 system_instruction="Return ONLY valid JSON.",
             ),
         )
@@ -212,21 +338,20 @@ No explanation.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  GEMINI ENRICHMENT — single trial (LLM-based classification)
+#  GEMINI ENRICHMENT — EXTRACTION ONLY (no classification here)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _enrich_single_trial(row, molecule_name, checkpoint, checkpoint_file, cp_lock):
-    """Enrich a single trial with Gemini. Returns (trial_id, conditions, trial_title, row)."""
+    """Extract indications from a single trial. Classification happens later."""
     trial_id = row.get("trial_id")
 
-    # Check checkpoint
     with cp_lock:
         if trial_id in checkpoint:
             cp = checkpoint[trial_id]
             return (trial_id, cp["conditions"], cp["trial_title"], row)
 
     prompt = f"""
-You are a clinical trial data assistant and pharmaceutical analyst.
+You are a clinical trial data assistant.
 
 Trial details:
 Molecule: {row.get('molecule_name')}
@@ -235,28 +360,13 @@ Trial ID: {trial_id}
 Phase: {row.get('phase')}
 Source URL: {row.get('source_url')}
 
-Your task:
-1. Extract ALL disease indications being studied in this clinical trial.
-2. Classify each indication as "Primary" or "Secondary".
-3. Assign a therapy_area to each indication.
+Your task: Extract ALL disease indications being studied in this clinical trial.
+Include BOTH the primary indication AND any secondary/exploratory indications that have documented outcomes.
 
-=== CLASSIFICATION RULES ===
+Look at the trial title, trial ID, source URL, and any available information to identify every
+disease or condition this trial is investigating.
 
-"Primary" indication:
-- The drug's main approved or originally intended indication
-- The core disease the drug was designed and initially developed to treat
-- What appears on the original FDA/EMA approved label
-
-"Secondary" indication — must meet ALL of the following criteria:
-{SECONDARY_INDICATION_CRITERIA}
-
-=== THERAPY AREA ===
-Assign one of: Metabolic, Cardiovascular, Oncology, Neuroscience, Immunology,
-Respiratory, Nephrology, Hepatology, Ophthalmology, Musculoskeletal,
-Gastroenterology, Infectious Disease, Dermatology, Hematology, Rare Disease,
-or another appropriate broad therapeutic area.
-
-=== PATTERNS TO LOOK FOR ===
+Common patterns to look for:
 - The trial title often contains the indication (e.g., "cardiovascular outcomes" → CV Risk Reduction)
 - "in subjects with type 2 diabetes" → T2DM
 - Trial acronyms like PIONEER, SUSTAIN, STEP, SELECT often indicate specific conditions
@@ -265,12 +375,8 @@ or another appropriate broad therapeutic area.
 Return ONLY valid JSON:
 {{
   "conditions": [
-    {{
-      "indication": "<disease or condition>",
-      "indication_type": "Primary" or "Secondary",
-      "therapy_area": "<broad therapeutic area>",
-      "rationale": "<why this indication was identified — cite the specific evidence>"
-    }}
+    {{"indication": "<disease or condition>", "rationale": "<why this indication was identified — cite the specific evidence from trial title, ID, or known trial data>"}},
+    {{"indication": "<disease or condition>", "rationale": "<why>"}}
   ],
   "trial_title": "<trial title>"
 }}
@@ -278,7 +384,8 @@ Return ONLY valid JSON:
 Rules:
 - Include ALL indications the trial is evaluating — both primary and secondary
 - Always extract at least the primary indication from the trial title/details
-- Each indication must have indication_type, therapy_area, and rationale
+- Each indication must have a rationale explaining what evidence led to its identification
+- If the trial title mentions a condition (e.g., "type 2 diabetes", "cardiovascular outcomes"), that IS an indication — extract it
 - No explanations outside the JSON
 """
     try:
@@ -319,32 +426,22 @@ Rules:
             conditions  = data.get("conditions", [])
             trial_title = data.get("trial_title", "N/A")
 
-            # Normalize to list of dicts with all required fields
             if isinstance(conditions, list):
                 normalized = []
                 for c in conditions:
                     if isinstance(c, dict):
                         normalized.append({
-                            "indication":      (c.get("indication") or "").strip(),
-                            "indication_type": (c.get("indication_type") or "Secondary").strip(),
-                            "therapy_area":    (c.get("therapy_area") or "Other").strip(),
-                            "rationale":       (c.get("rationale") or "").strip(),
+                            "indication": (c.get("indication") or "").strip(),
+                            "rationale":  (c.get("rationale") or "").strip(),
                         })
                     elif isinstance(c, str) and c.strip():
-                        normalized.append({
-                            "indication":      c.strip(),
-                            "indication_type": "Secondary",
-                            "therapy_area":    "Other",
-                            "rationale":       "",
-                        })
+                        normalized.append({"indication": c.strip(), "rationale": ""})
                 conditions = normalized
             else:
-                conditions = [{"indication": str(conditions), "indication_type": "Secondary",
-                               "therapy_area": "Other", "rationale": ""}]
+                conditions = [{"indication": str(conditions), "rationale": ""}]
 
-            # Deduplicate by indication name
-            seen = set()
-            deduped = []
+            # Deduplicate
+            seen, deduped = set(), []
             for c in conditions:
                 key = c["indication"].lower()
                 if key and key not in seen:
@@ -352,7 +449,7 @@ Rules:
                     deduped.append(c)
             conditions = deduped
 
-            print(f"   ✅ {trial_id}: {', '.join(c['indication'] + ' (' + c['indication_type'] + ')' for c in conditions) if conditions else 'no indications'}")
+            print(f"   ✅ {trial_id}: {', '.join(c['indication'] for c in conditions) if conditions else 'no indications'}")
 
             with cp_lock:
                 checkpoint[trial_id] = {"conditions": conditions, "trial_title": trial_title}
@@ -369,7 +466,6 @@ Rules:
 def enrich_with_gemini(rows, molecule_name):
     import threading
 
-    enriched = []
     total = len(rows)
     checkpoint_file = f"checkpoint_{molecule_name.lower().replace(' ', '_')}.json"
     checkpoint = load_checkpoint(checkpoint_file)
@@ -377,12 +473,13 @@ def enrich_with_gemini(rows, molecule_name):
     print(f"📁 Loaded checkpoint → {len(checkpoint)} completed rows\n")
     print(f"🚀 Processing {total} trials with {MAX_WORKERS} parallel workers…\n")
 
-    # ── Parallel enrichment ──────────────────────────────────────────────
+    # ── STEP 1: Parallel extraction ──────────────────────────────────────
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
             executor.submit(
-                _enrich_single_trial, row, molecule_name, checkpoint, checkpoint_file, cp_lock
+                _enrich_single_trial, row, molecule_name,
+                checkpoint, checkpoint_file, cp_lock
             ): i
             for i, row in enumerate(rows)
         }
@@ -395,69 +492,79 @@ def enrich_with_gemini(rows, molecule_name):
                 print(f"   ❌ Unexpected error for {row.get('trial_id')}: {e}")
                 results.append((row.get("trial_id"), [], str(e), row))
 
-    # ── Sort by original order ───────────────────────────────────────────
+    # Sort by original order
     trial_order = {row.get("trial_id"): i for i, row in enumerate(rows)}
     results.sort(key=lambda r: trial_order.get(r[0], 0))
 
-    # ── Unnest (one row per indication), use LLM classification ──────────
+    # ── Unnest into flat rows (no classification yet) ────────────────────
+    flat_rows = []
     for trial_id, conditions, trial_title, row in results:
         if not conditions:
-            enriched.append({
-                "molecule_name":   row.get("molecule_name"),
-                "company_name":    row.get("company_name"),
-                "indication":      "No indication found",
-                "rationale":       "",
-                "indication_type": "",
-                "therapy_area":    "",
-                "trial_title":     trial_title,
-                "trial_id":        trial_id,
-                "phase":           row.get("phase"),
-                "source_url":      row.get("source_url"),
-                "data_source":     "Clinical Trials",
+            flat_rows.append({
+                "molecule_name": row.get("molecule_name"),
+                "company_name":  row.get("company_name"),
+                "indication":    "No indication found",
+                "rationale":     "",
+                "trial_title":   trial_title,
+                "trial_id":      trial_id,
+                "phase":         row.get("phase"),
+                "source_url":    row.get("source_url"),
+                "data_source":   "Clinical Trials",
             })
             continue
 
         seen = set()
         for c in conditions:
-            raw_indication = c.get("indication", "")
-            if not raw_indication:
+            raw = c.get("indication", "")
+            if not raw:
                 continue
-
-            # Light normalization via standardize_indication (keeps names clean)
-            std = standardize_indication(raw_indication)
+            std = standardize_indication(raw)
             if not std or std.lower() in ("error", "n/a", "no indication found", "none"):
                 continue
             if std.lower() in seen:
                 continue
             seen.add(std.lower())
 
-            enriched.append({
-                "molecule_name":   row.get("molecule_name"),
-                "company_name":    row.get("company_name"),
-                "indication":      std,
-                "rationale":       c.get("rationale", ""),
-                "indication_type": c.get("indication_type", "Secondary"),
-                "therapy_area":    c.get("therapy_area", "Other"),
-                "trial_title":     trial_title,
-                "trial_id":        trial_id,
-                "phase":           row.get("phase"),
-                "source_url":      row.get("source_url"),
-                "data_source":     "Clinical Trials",
+            flat_rows.append({
+                "molecule_name": row.get("molecule_name"),
+                "company_name":  row.get("company_name"),
+                "indication":    std,
+                "rationale":     c.get("rationale", ""),
+                "trial_title":   trial_title,
+                "trial_id":      trial_id,
+                "phase":         row.get("phase"),
+                "source_url":    row.get("source_url"),
+                "data_source":   "Clinical Trials",
             })
 
-    # ── Compute Ep (row-wise) ────────────────────────────────────────────
-    for row in enriched:
+    # ── STEP 2: Classify all unique indications in ONE LLM+Search call ──
+    unique_indications = sorted(set(
+        r["indication"] for r in flat_rows
+        if r["indication"] != "No indication found"
+    ))
+
+    classification_map = classify_indications_with_llm(molecule_name, unique_indications)
+
+    # Apply classification to every row
+    for row in flat_rows:
+        ind_key = row["indication"].lower()
+        cls = classification_map.get(ind_key, {})
+        row["indication_type"] = cls.get("indication_type", "")
+        row["therapy_area"]    = cls.get("therapy_area", "")
+
+    # ── STEP 3: Compute Ep (row-wise) ────────────────────────────────────
+    for row in flat_rows:
         row["Ep"] = compute_ep(row.get("phase"))
 
-    # ── Compute Et (drug-level) ──────────────────────────────────────────
-    print("🔹 Computing Et (drug-level expansion score)...")
-    et_value = compute_et(enriched, molecule_name)
-    for row in enriched:
+    # ── STEP 4: Compute Et (drug-level) ──────────────────────────────────
+    print("🔹 Computing Et (drug-level expansion score)…")
+    et_value = compute_et(flat_rows, molecule_name)
+    for row in flat_rows:
         row["Et"] = et_value
     print(f"   Et = {et_value}")
 
-    print(f"\n✅ Completed. {len(enriched)} rows (unnested, LLM-classified)\n")
-    return enriched
+    print(f"\n✅ Completed. {len(flat_rows)} rows (extracted → classified → scored)\n")
+    return flat_rows
 
 
 # ── COMMON FORMAT HEADERS ────────────────────────────────────────────────────
