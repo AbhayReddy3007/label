@@ -175,7 +175,8 @@ Return ONLY valid JSON — no markdown fences, no explanation:
     {{
       "indication": "<exact indication name from input list>",
       "indication_type": "Primary" or "Secondary",
-      "therapy_area": "<therapy area>"
+      "therapy_area": "<therapy area>",
+      "rationale": "<explain WHY this indication is Primary or Secondary for this drug — cite the specific evidence you found, e.g. FDA approval, original label, known label expansion, clinical data>"
     }}
   ]
 }}
@@ -208,6 +209,7 @@ Return ONLY valid JSON — no markdown fences, no explanation:
                 result[name.lower()] = {
                     "indication_type": c.get("indication_type", "Secondary"),
                     "therapy_area":    c.get("therapy_area", "Other"),
+                    "rationale":       c.get("rationale", ""),
                 }
                 print(f"   • {name}: {c.get('indication_type')} | {c.get('therapy_area')}")
 
@@ -218,6 +220,7 @@ Return ONLY valid JSON — no markdown fences, no explanation:
                 result[ind.lower()] = {
                     "indication_type": "Secondary",
                     "therapy_area":    "Other",
+                    "rationale":       "Classification not returned by LLM",
                 }
 
         return result
@@ -226,7 +229,8 @@ Return ONLY valid JSON — no markdown fences, no explanation:
         print(f"   ❌ Classification failed: {e}")
         # Return defaults for everything
         return {
-            ind.lower(): {"indication_type": "Secondary", "therapy_area": "Other"}
+            ind.lower(): {"indication_type": "Secondary", "therapy_area": "Other",
+                          "rationale": f"Classification failed: {e}"}
             for ind in unique_indications
         }
 
@@ -551,6 +555,7 @@ def enrich_with_gemini(rows, molecule_name):
         cls = classification_map.get(ind_key, {})
         row["indication_type"] = cls.get("indication_type", "")
         row["therapy_area"]    = cls.get("therapy_area", "")
+        row["rationale"]       = cls.get("rationale", "")
 
     # ── STEP 3: Compute Ep (row-wise) ────────────────────────────────────
     for row in flat_rows:
@@ -579,7 +584,7 @@ def _thin_border():
                   right=Side(style="thin", color="DDDDDD"))
 
 
-def write_excel(rows, molecule_name):
+def write_excel(rows, molecule_name, output_dir=None):
     print("🔹 Writing Excel...")
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -625,18 +630,29 @@ def write_excel(rows, molecule_name):
         ws.column_dimensions[get_column_letter(i)].width = w
 
     file_name = f"{molecule_name.lower().replace(' ', '_')}_clinical_efficacy.xlsx"
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        file_name = os.path.join(output_dir, file_name)
     wb.save(file_name)
     print(f"✅ Excel saved → {file_name}\n")
     return file_name
 
 
 def main():
+    from datetime import datetime
+
     parser = argparse.ArgumentParser()
     parser.add_argument("molecule_name")
     args = parser.parse_args([a for a in sys.argv[1:] if a != "--"])
     molecule = args.molecule_name
 
+    # Create timestamped output folder
+    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = f"output_{timestamp}"
+    os.makedirs(output_dir, exist_ok=True)
+
     print("\n🚀 Pipeline Started\n")
+    print(f"📂 Output folder: {output_dir}\n")
     print("[1/3] Fetching data...")
     rows = fetch_rows(molecule)
     if not rows:
@@ -645,7 +661,7 @@ def main():
     print("[2/3] Enriching data...")
     enriched = enrich_with_gemini(rows, molecule)
     print("[3/3] Generating Excel...")
-    output = write_excel(enriched, molecule)
+    output = write_excel(enriched, molecule, output_dir)
     print("🎉 DONE")
     print(f"📄 File: {output}")
     print(f"📊 Rows processed: {len(enriched)}")
