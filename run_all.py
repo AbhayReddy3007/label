@@ -171,7 +171,8 @@ Return ONLY valid JSON — no markdown fences, no explanation:
     {{
       "indication": "<exact indication name from input list>",
       "indication_type": "Primary" or "Secondary",
-      "therapy_area": "<therapy area>"
+      "therapy_area": "<therapy area>",
+      "rationale": "<explain WHY this indication is Primary or Secondary for this drug — cite the specific evidence you found, e.g. FDA approval, original label, known label expansion, clinical data>"
     }}
   ]
 }}
@@ -204,20 +205,23 @@ Return ONLY valid JSON — no markdown fences, no explanation:
                 result[name.lower()] = {
                     "indication_type": c.get("indication_type", "Secondary"),
                     "therapy_area":    c.get("therapy_area", "Other"),
+                    "rationale":       c.get("rationale", ""),
                 }
                 print(f"     • {name}: {c.get('indication_type')} | {c.get('therapy_area')}")
 
         for ind in unique_indications:
             if ind.lower() not in result:
                 print(f"     ⚠️  Missing classification for '{ind}' — defaulting")
-                result[ind.lower()] = {"indication_type": "Secondary", "therapy_area": "Other"}
+                result[ind.lower()] = {"indication_type": "Secondary", "therapy_area": "Other",
+                                       "rationale": "Classification not returned by LLM"}
 
         return result
 
     except Exception as e:
         print(f"     ❌ Classification failed: {e}")
         return {
-            ind.lower(): {"indication_type": "Secondary", "therapy_area": "Other"}
+            ind.lower(): {"indication_type": "Secondary", "therapy_area": "Other",
+                          "rationale": f"Classification failed: {e}"}
             for ind in unique_indications
         }
 
@@ -576,6 +580,7 @@ def _gemini_enrich_trials(rows: list[dict], molecule_name: str,
         cls = classification_map.get(row["indication"].lower(), {})
         row["indication_type"] = cls.get("indication_type", "")
         row["therapy_area"]    = cls.get("therapy_area", "")
+        row["rationale"]       = cls.get("rationale", "")
 
     # ── STEP 3: Ep (row-wise) ────────────────────────────────────────────
     for row in flat:
@@ -824,6 +829,7 @@ def _innovator_research(molecule: str, company: str) -> list[dict]:
         cls = classification_map.get(row["indication"].lower(), {})
         row["indication_type"] = cls.get("indication_type", "")
         row["therapy_area"]    = cls.get("therapy_area", "")
+        row["rationale"]       = cls.get("rationale", "")
 
     # ── Ep (row-wise) ────────────────────────────────────────────────────
     for row in unique:
@@ -970,8 +976,8 @@ def main():
     )
     parser.add_argument("--company", default=None,
                         help="Innovator company (only used with a single molecule)")
-    parser.add_argument("--output-dir", default=".",
-                        help="Directory to write output files (default: current dir)")
+    parser.add_argument("--output-dir", default=None,
+                        help="Directory to write output files (default: output_<timestamp>)")
     parser.add_argument("--skip-existing", action="store_true",
                         help="(--all mode) skip molecules whose Excel file already exists")
     parser.add_argument("--master-file", default=None,
@@ -984,7 +990,9 @@ def main():
     if not GEMINI_API_KEY:
         sys.exit("❌  GEMINI_API_KEY not set in .env")
 
-    output_dir = Path(args.output_dir)
+    # Create timestamped output folder
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(args.output_dir) if args.output_dir else Path(f"output_{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Build the molecule list ──────────────────────────────────────────
