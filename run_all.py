@@ -18,8 +18,13 @@ Indications are standardized and classified as Primary or Secondary.
 Each row has exactly ONE indication (multi-indication trials are unnested).
 
 Usage:
+    # Single molecule
     python run_all.py --molecule semaglutide
     python run_all.py --molecule semaglutide --company "Novo Nordisk"
+
+    # All molecules in BigQuery (one Excel file per molecule + a master file)
+    python run_all.py --all
+    python run_all.py --all --skip-existing   # skip molecules already processed
 """
 
 import sys
@@ -90,6 +95,21 @@ def _bq_client():
         scopes=["https://www.googleapis.com/auth/cloud-platform"],
     )
     return bigquery.Client(project=GBQ_PROJECT, credentials=credentials)
+
+
+def fetch_all_molecules() -> list[str]:
+    """Return the list of distinct molecule names in the BigQuery table."""
+    print("  🔹 Fetching all distinct molecules from BigQuery…")
+    client = _bq_client()
+    query = f"""
+        SELECT DISTINCT molecule_name
+        FROM `{GBQ_PROJECT}.{GBQ_DATASET}.{GBQ_TABLE}`
+        ORDER BY molecule_name
+    """
+    results = client.query(query).result()
+    molecules = [row["molecule_name"] for row in results if row["molecule_name"]]
+    print(f"  ✅ Found {len(molecules)} distinct molecules: {molecules}\n")
+    return molecules
 
 
 def fetch_bq_rows(molecule_name: str) -> list[dict]:
@@ -328,10 +348,6 @@ def run_label(molecule: str) -> list[dict]:
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MODULE B — drug_indication_researcher.py
-#
-#  Searches innovator/investor/SEC sources: FDA labels, investor presentations,
-#  press releases, pipeline pages, SEC filings (10-K/10-Q/8-K/20-F/6-K).
-#  Each row = one indication × one source document.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _identify_company(molecule: str) -> str:
@@ -487,7 +503,6 @@ def _research_single_source(q, molecule, company, client, gen_types):
             std = standardize_indication(raw)
             if std.lower() in ("error", "n/a", "none", "no indication found"):
                 continue
-            # Build rationale: prefer explicit rationale, fall back to detail
             rationale = (e.get("rationale") or e.get("detail") or "").strip()
             rows.append({
                 "molecule_name":   molecule.title(),
@@ -520,7 +535,6 @@ def _innovator_research(molecule: str, company: str) -> list[dict]:
 
     print(f"  🚀 Querying {len(queries)} innovator sources in parallel…\n")
 
-    # ── Parallel source queries ──────────────────────────────────────────
     with ThreadPoolExecutor(max_workers=MAX_WORKERS_INNOVATOR) as executor:
         futures = {
             executor.submit(
@@ -536,7 +550,6 @@ def _innovator_research(molecule: str, company: str) -> list[dict]:
             except Exception as ex:
                 print(f"     ❌ {source_type}: {ex}")
 
-    # dedup only exact same indication + same source doc
     seen, unique = set(), []
     for row in all_rows:
         key = (row["indication"], row["trial_title"], row["data_source"])
@@ -615,57 +628,195 @@ def _write_standard_sheet(ws, rows: list[dict], molecule: str, sheet_title: str)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MAIN
+#  PER-MOLECULE EXCEL WRITER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main():
-    parser = argparse.ArgumentParser(description="Unified drug research pipeline → single Excel")
-    parser.add_argument("--molecule", required=True, help="Drug/molecule name, e.g. semaglutide")
-    parser.add_argument("--company",  default=None,
-                        help="Innovator company name, e.g. 'Novo Nordisk' (improves innovator search)")
-    args = parser.parse_args()
-
-    molecule = args.molecule.strip()
-    slug     = molecule.lower().replace(" ", "_")
-    out_file = f"{slug}_research.xlsx"
-
-    print(f"\n{'━'*62}")
-    print(f"  Molecule : {molecule.title()}")
-    print(f"  Output   : {out_file}")
-    print(f"{'━'*62}")
-
-    if not GEMINI_API_KEY:
-        sys.exit("❌  GEMINI_API_KEY not set in .env")
-
-    # ── run all modules ───────────────────────────────────────────────────
-    label_rows      = run_label(molecule)
-    indication_rows = run_indication_researcher(molecule, args.company)
-
-    # ── assemble workbook ─────────────────────────────────────────────────
-    print(f"\n📊 Writing {out_file}…")
+def write_molecule_excel(molecule: str, label_rows: list[dict],
+                         indication_rows: list[dict], out_file: str):
+    """Write the 3-sheet Excel for a single molecule."""
     wb = openpyxl.Workbook()
 
-    # Sheet 1 — Clinical Efficacy
     ws1       = wb.active
     ws1.title = "Clinical Efficacy"
     _write_standard_sheet(ws1, label_rows, molecule, "Clinical Efficacy")
 
-    # Sheet 2 — Drug Indication Research (Innovator + SEC)
     ws2       = wb.create_sheet("Drug Indication Research")
     _write_standard_sheet(ws2, indication_rows, molecule, "Drug Indication Research")
 
-    # Sheet 3 — Combined (both merged)
     combined  = label_rows + indication_rows
     ws3       = wb.create_sheet("All Combined")
     _write_standard_sheet(ws3, combined, molecule, "All Sources Combined")
 
     wb.save(out_file)
+    return combined
 
-    print(f"\n✅  Done!")
-    print(f"📄  File   : {out_file}")
-    print(f"📊  Sheets : Clinical Efficacy ({len(label_rows)}) | "
-          f"Drug Indication Research ({len(indication_rows)}) | "
-          f"All Combined ({len(combined)})")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MASTER EXCEL WRITER  (one sheet per molecule + grand summary)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def write_master_excel(all_results: dict[str, list[dict]], out_file: str):
+    """
+    all_results: {molecule_name: [combined rows]}
+    Writes one sheet per molecule + a grand 'All Molecules' sheet.
+    """
+    print(f"\n📊 Writing master file: {out_file}…")
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)   # remove default empty sheet
+
+    grand_rows = []
+
+    for molecule, rows in all_results.items():
+        # Truncate sheet name to Excel's 31-char limit
+        sheet_name = molecule.title()[:31]
+        ws = wb.create_sheet(sheet_name)
+        _write_standard_sheet(ws, rows, molecule, "All Sources")
+        grand_rows.extend(rows)
+
+    ws_all = wb.create_sheet("All Molecules")
+    _write_standard_sheet(ws_all, grand_rows, "All Molecules", "Grand Summary")
+
+    wb.save(out_file)
+    print(f"✅  Master file saved: {out_file}  ({len(grand_rows)} total rows across {len(all_results)} molecules)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SINGLE-MOLECULE PIPELINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def process_molecule(molecule: str, company: str | None = None,
+                     output_dir: str = ".") -> tuple[list[dict], list[dict]]:
+    """Run both modules for one molecule. Returns (label_rows, indication_rows)."""
+    label_rows      = run_label(molecule)
+    indication_rows = run_indication_researcher(molecule, company)
+    return label_rows, indication_rows
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(description="Unified drug research pipeline → Excel")
+    group  = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--molecule", help="Single drug/molecule name, e.g. semaglutide")
+    group.add_argument("--all", action="store_true",
+                       help="Run pipeline for ALL distinct molecules in BigQuery")
+    parser.add_argument("--company", default=None,
+                        help="Innovator company (only used with --molecule)")
+    parser.add_argument("--output-dir", default=".",
+                        help="Directory to write output files (default: current dir)")
+    parser.add_argument("--skip-existing", action="store_true",
+                        help="(--all mode) skip molecules whose Excel file already exists")
+    parser.add_argument("--master-file", default=None,
+                        help="(--all mode) filename for the master combined Excel "
+                             "(default: all_molecules_research_<timestamp>.xlsx)")
+    args = parser.parse_args()
+
+    if not GEMINI_API_KEY:
+        sys.exit("❌  GEMINI_API_KEY not set in .env")
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── SINGLE-MOLECULE MODE ──────────────────────────────────────────────
+    if args.molecule:
+        molecule = args.molecule.strip()
+        slug     = molecule.lower().replace(" ", "_")
+        out_file = output_dir / f"{slug}_research.xlsx"
+
+        print(f"\n{'━'*62}")
+        print(f"  Molecule : {molecule.title()}")
+        print(f"  Output   : {out_file}")
+        print(f"{'━'*62}")
+
+        label_rows, indication_rows = process_molecule(molecule, args.company)
+        combined = write_molecule_excel(molecule, label_rows, indication_rows, str(out_file))
+
+        print(f"\n✅  Done!")
+        print(f"📄  File   : {out_file}")
+        print(f"📊  Sheets : Clinical Efficacy ({len(label_rows)}) | "
+              f"Drug Indication Research ({len(indication_rows)}) | "
+              f"All Combined ({len(combined)})")
+        return
+
+    # ── ALL-MOLECULES MODE ────────────────────────────────────────────────
+    print(f"\n{'━'*62}")
+    print(f"  Mode     : ALL MOLECULES")
+    print(f"  Output   : {output_dir}")
+    print(f"{'━'*62}\n")
+
+    molecules = fetch_all_molecules()
+    if not molecules:
+        sys.exit("❌  No molecules found in BigQuery.")
+
+    timestamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
+    master_file  = args.master_file or f"all_molecules_research_{timestamp}.xlsx"
+    master_path  = output_dir / master_file
+
+    all_results: dict[str, list[dict]] = {}
+    failed:      list[str]             = []
+
+    total = len(molecules)
+    for i, molecule in enumerate(molecules, 1):
+        slug     = molecule.lower().replace(" ", "_")
+        out_file = output_dir / f"{slug}_research.xlsx"
+
+        print(f"\n{'═'*62}")
+        print(f"  [{i}/{total}] {molecule.title()}")
+        print(f"{'═'*62}")
+
+        # Skip if already done
+        if args.skip_existing and out_file.exists():
+            print(f"  ⏭️  Skipping — file already exists: {out_file}")
+            # Still try to load existing combined rows for the master file
+            try:
+                wb_existing = openpyxl.load_workbook(str(out_file), read_only=True, data_only=True)
+                ws_comb = wb_existing["All Combined"]
+                rows_existing = []
+                headers_row = None
+                for row_cells in ws_comb.iter_rows(min_row=3, values_only=True):
+                    if headers_row is None:
+                        headers_row = list(row_cells)
+                        continue
+                    if any(c for c in row_cells):
+                        rows_existing.append(dict(zip(HEADERS, row_cells)))
+                all_results[molecule] = rows_existing
+                wb_existing.close()
+            except Exception as e:
+                print(f"  ⚠️  Could not read existing file for master: {e}")
+                all_results[molecule] = []
+            continue
+
+        try:
+            label_rows, indication_rows = process_molecule(molecule)
+            combined = write_molecule_excel(molecule, label_rows, indication_rows, str(out_file))
+            all_results[molecule] = combined
+
+            print(f"\n  ✅ {molecule.title()} done → {out_file}")
+            print(f"     Clinical Efficacy: {len(label_rows)} | "
+                  f"Indication Research: {len(indication_rows)} | "
+                  f"Combined: {len(combined)}")
+
+        except Exception as e:
+            print(f"\n  ❌ FAILED: {molecule} — {e}")
+            failed.append(molecule)
+            all_results[molecule] = []
+
+    # Write master file
+    write_master_excel(all_results, str(master_path))
+
+    # Summary
+    print(f"\n{'━'*62}")
+    print(f"  Pipeline complete!")
+    print(f"  Molecules processed : {total}")
+    print(f"  Succeeded           : {total - len(failed)}")
+    print(f"  Failed              : {len(failed)}")
+    if failed:
+        print(f"  Failed molecules    : {', '.join(failed)}")
+    print(f"  Master file         : {master_path}")
+    print(f"  Per-molecule files  : {output_dir}/<molecule>_research.xlsx")
+    print(f"{'━'*62}\n")
 
 
 if __name__ == "__main__":
