@@ -1,35 +1,25 @@
 """
 Unified Drug Research Pipeline
 ===============================
-Runs all two modules and writes every result into a single Excel file,
+Runs both modules and writes results into a single Excel file per molecule,
 one sheet per module, plus a combined sheet.
 
 Modules:
   [1/2] Clinical Efficacy    — BigQuery clinical trial data enriched via Gemini
-  [2/2] Drug Indication Research — Innovator sources (FDA labels, investor
-         presentations, press releases, pipeline pages, SEC filings) via
-         Gemini + Google Search
+  [2/2] Drug Indication Research — Innovator sources via Gemini + Google Search
 
-All sheets use the SAME standardized column format:
-    molecule_name | company_name | indication | rationale | indication_type |
-    therapy_area  | trial_title  | trial_id   | phase     | source_url      |
-    data_source   | Ep           | Et
-
-Indications are classified as Primary or Secondary by the LLM.
-Therapy area is assigned by the LLM.
-Each row has exactly ONE indication (multi-indication trials are unnested).
+Classification (Primary / Secondary) and therapy area assignment are done
+via a SEPARATE Gemini + Google Search call that actually researches the drug.
 
 Usage:
-    # Single molecule
-    python run_all.py --molecule semaglutide
-    python run_all.py --molecule semaglutide --company "Novo Nordisk"
+    # One or more specific molecules
+    python run_all.py Semaglutide
+    python run_all.py Semaglutide Tirzepatide
+    python run_all.py "Cagrilintide+Semaglutide" Tirzepatide
 
-    # Multiple selected molecules
-    python run_all.py --drugs Semaglutide Liraglutide Tirzepatide
-
-    # All molecules in BigQuery (one Excel file per molecule + a master file)
+    # All molecules in BigQuery
     python run_all.py --all
-    python run_all.py --all --skip-existing   # skip molecules already processed
+    python run_all.py --all --skip-existing
 """
 
 import sys
@@ -65,8 +55,8 @@ GEMINI_API_URL = (
 )
 
 # ── Parallel config ───────────────────────────────────────────────────────────
-MAX_WORKERS_TRIALS    = 10   # parallel Gemini calls for clinical trial enrichment
-MAX_WORKERS_INNOVATOR = 5    # parallel Gemini calls for innovator source queries
+MAX_WORKERS_TRIALS    = 10
+MAX_WORKERS_INNOVATOR = 5
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -74,15 +64,20 @@ from openpyxl.utils import get_column_letter
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECONDARY INDICATION CRITERIA (from drug_indication_researcher.py)
+#  SECONDARY INDICATION CRITERIA
 # ══════════════════════════════════════════════════════════════════════════════
 
 SECONDARY_INDICATION_CRITERIA = """
 A secondary indication qualifies ONLY if ALL of the following are true:
 
-- The indication represents a true expansion — i.e., it is not part of the primary indication (for clinical assets) or currently approved label (for commercial assets)
-- The indication is described at a clear disease-level definition, avoiding vague, overlapping, or synonymous representations
-- The source must describe observed or measured outcomes in that specific indication (e.g., trial results, endpoint readouts, biomarker response), not just planned evaluation or exploratory intent
+- The indication represents a true expansion — i.e., it is not part of the
+  primary indication (for clinical assets) or currently approved label
+  (for commercial assets)
+- The indication is described at a clear disease-level definition, avoiding
+  vague, overlapping, or synonymous representations
+- The source must describe observed or measured outcomes in that specific
+  indication (e.g., trial results, endpoint readouts, biomarker response),
+  not just planned evaluation or exploratory intent
 
 The following must NOT be considered secondary indications:
 * Indications mentioned only as hypothesis, targets, or exploratory possibilities
@@ -94,7 +89,7 @@ The following must NOT be considered secondary indications:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  COMMON FORMAT — all sheets share these columns
+#  COMMON FORMAT
 # ══════════════════════════════════════════════════════════════════════════════
 
 HEADERS    = ["molecule_name", "company_name", "indication", "rationale",
@@ -104,16 +99,134 @@ COL_WIDTHS = [18, 22, 28, 40, 16, 18, 50, 18, 10, 40, 16, 8, 8]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Ep SCORE — row-wise, based on phase
+#  LLM CLASSIFICATION — one call per drug, with Google Search grounding
+# ══════════════════════════════════════════════════════════════════════════════
+
+def classify_indications_with_llm(molecule_name, unique_indications,
+                                   gemini_client=None, gen_types=None):
+    """
+    Uses Gemini + Google Search to research the drug and classify each
+    indication as Primary / Secondary, and assign therapy areas.
+    """
+    if not unique_indications:
+        return {}
+
+    if gemini_client is None:
+        from google import genai as _genai
+        from google.genai import types as _types
+        gemini_client = _genai.Client(api_key=GEMINI_API_KEY)
+        gen_types = _types
+
+    indications_json = json.dumps(unique_indications, indent=2)
+
+    prompt = f"""
+You are a pharmaceutical analyst. Your task is to research the drug
+"{molecule_name}" and classify each of the following indications.
+
+Drug / Molecule: {molecule_name}
+
+Indications to classify:
+{indications_json}
+
+═══ STEP 1 — Research the drug ═══
+Search the web to find:
+  • What "{molecule_name}" is primarily approved / developed for
+  • The FDA / EMA approved labels for this drug
+  • The originator company's pipeline and clinical development programs
+
+═══ STEP 2 — Classify each indication ═══
+For EACH indication in the list above:
+
+  indication_type:
+    "Primary"   — this IS one of the drug's main approved or originally
+                   intended indications (what it was designed and first
+                   developed / approved to treat).
+    "Secondary" — this is a label expansion or additional indication
+                   beyond the primary use.
+                   {SECONDARY_INDICATION_CRITERIA}
+
+  therapy_area:
+    Look at the INDICATION itself (the disease / condition) and determine
+    which medical specialty treats it.
+    Choose from: Metabolic, Cardiovascular, Oncology, Neuroscience,
+    Immunology, Respiratory, Nephrology, Hepatology, Ophthalmology,
+    Musculoskeletal, Gastroenterology, Infectious Disease, Dermatology,
+    Hematology, Endocrinology, Rare Disease, or another appropriate
+    broad therapeutic area.
+
+    Examples:
+      T2DM / Type 2 Diabetes / Obesity → Metabolic
+      Heart Failure / MACE / CV Risk Reduction → Cardiovascular
+      CKD / Diabetic Kidney Disease → Nephrology
+      NASH / MASH → Hepatology
+      NSCLC / Breast Cancer → Oncology
+      Alzheimer's Disease → Neuroscience
+      Rheumatoid Arthritis / Psoriasis → Immunology
+      COPD / Asthma → Respiratory
+      OSA (Obstructive Sleep Apnea) → Respiratory
+
+Return ONLY valid JSON — no markdown fences, no explanation:
+{{
+  "classifications": [
+    {{
+      "indication": "<exact indication name from input list>",
+      "indication_type": "Primary" or "Secondary",
+      "therapy_area": "<therapy area>"
+    }}
+  ]
+}}
+"""
+
+    print(f"  🔹 Classifying {len(unique_indications)} unique indications for {molecule_name} (LLM + Search)…")
+    try:
+        resp = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=gen_types.GenerateContentConfig(
+                temperature=0,
+                tools=[gen_types.Tool(google_search=gen_types.GoogleSearch())],
+                system_instruction=(
+                    "You are a pharmaceutical analyst. "
+                    "Search the web to find what this drug is approved for. "
+                    "Return ONLY valid JSON — no markdown, no explanation."
+                ),
+            ),
+        )
+        text = resp.text.strip()
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+        data = json.loads(text)
+        classifications = data.get("classifications", [])
+
+        result = {}
+        for c in classifications:
+            name = c.get("indication", "").strip()
+            if name:
+                result[name.lower()] = {
+                    "indication_type": c.get("indication_type", "Secondary"),
+                    "therapy_area":    c.get("therapy_area", "Other"),
+                }
+                print(f"     • {name}: {c.get('indication_type')} | {c.get('therapy_area')}")
+
+        for ind in unique_indications:
+            if ind.lower() not in result:
+                print(f"     ⚠️  Missing classification for '{ind}' — defaulting")
+                result[ind.lower()] = {"indication_type": "Secondary", "therapy_area": "Other"}
+
+        return result
+
+    except Exception as e:
+        print(f"     ❌ Classification failed: {e}")
+        return {
+            ind.lower(): {"indication_type": "Secondary", "therapy_area": "Other"}
+            for ind in unique_indications
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Ep SCORE — row-wise
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_ep(phase) -> str:
-    """
-    Ep score based on clinical trial phase (row-wise).
-    Phase 4 or 3 → 5
-    Phase 2     → 4
-    Phase 1     → 3
-    """
     phase_str = str(phase).strip().lower() if phase else ""
     nums = re.findall(r'\d+', phase_str)
     if not nums:
@@ -131,18 +244,11 @@ def compute_ep(phase) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Et SCORE — drug-level, based on therapy area & indication breadth
+#  Et SCORE — drug-level
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_et(enriched_rows, molecule_name, gemini_client=None, gen_types=None):
-    """
-    Et score computed across all rows for a drug:
-      Multiple therapy areas                              → 5
-      1 therapy area, 2+ secondary indications            → 4
-      1 therapy area, 1 secondary (broad)                 → 3
-      1 therapy area, 1 secondary (very niche)            → 2
-      1 therapy area, primary indication(s) only          → 1
-    """
+def compute_et(enriched_rows, molecule_name,
+               gemini_client=None, gen_types=None):
     drug_rows = [r for r in enriched_rows
                  if r.get("molecule_name", "").lower() == molecule_name.lower()]
     if not drug_rows:
@@ -176,7 +282,6 @@ def compute_et(enriched_rows, molecule_name, gemini_client=None, gen_types=None)
 
 def _check_niche(molecule, primary_list, secondary_indication,
                  gemini_client=None, gen_types=None):
-    """Use Gemini to determine if a single secondary indication is very niche."""
     primary_str = ", ".join(primary_list) if primary_list else "unknown"
     prompt = f"""
 You are a pharmaceutical analyst.
@@ -190,6 +295,9 @@ A label expansion is "very niche" if it targets a narrow, specialized patient
 sub-population, a rare disease, an orphan indication, or a highly specific
 clinical context that affects relatively few patients compared to the primary
 indication.
+
+Search the web to determine the patient population size for this secondary
+indication compared to the primary indication.
 
 Return ONLY valid JSON:
 {{"is_niche": true}} or {{"is_niche": false}}
@@ -207,15 +315,15 @@ No explanation.
             contents=prompt,
             config=gen_types.GenerateContentConfig(
                 temperature=0,
+                tools=[gen_types.Tool(google_search=gen_types.GoogleSearch())],
                 system_instruction="Return ONLY valid JSON.",
             ),
         )
-        text = resp.text.strip()
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp.text.strip()).strip()
         data = json.loads(text)
         return data.get("is_niche", False)
     except Exception as e:
-        print(f"   ⚠️  Niche check failed: {e} — defaulting to non-niche")
+        print(f"     ⚠️  Niche check failed: {e} — defaulting to non-niche")
         return False
 
 
@@ -234,7 +342,6 @@ def _bq_client():
 
 
 def fetch_all_molecules() -> list[str]:
-    """Return the list of distinct molecule names in the BigQuery table."""
     print("  🔹 Fetching all distinct molecules from BigQuery…")
     client = _bq_client()
     query = f"""
@@ -282,11 +389,11 @@ def save_checkpoint(path: str, data: dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  GEMINI ENRICHMENT (clinical trials) — LLM-based classification
+#  GEMINI ENRICHMENT — EXTRACTION ONLY (classification happens after)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _enrich_single_trial(row, molecule_name, client, gen_types, checkpoint, cp_file, cp_lock):
-    """Enrich a single trial. Returns (trial_id, conditions, trial_title, row)."""
+    """Extract indications from a single trial. Classification happens later."""
     trial_id = row.get("trial_id")
 
     with cp_lock:
@@ -295,7 +402,7 @@ def _enrich_single_trial(row, molecule_name, client, gen_types, checkpoint, cp_f
             return (trial_id, data["conditions"], data["trial_title"], row)
 
     prompt = f"""
-You are a clinical trial data assistant and pharmaceutical analyst.
+You are a clinical trial data assistant.
 
 Trial details:
 Molecule: {row.get('molecule_name')}
@@ -304,29 +411,14 @@ Trial ID: {trial_id}
 Phase:    {row.get('phase')}
 Source URL: {row.get('source_url')}
 
-Your task:
-1. Extract ALL disease indications being studied in this clinical trial.
-2. Classify each indication as "Primary" or "Secondary".
-3. Assign a therapy_area to each indication.
+Your task: Extract ALL disease indications being studied in this clinical trial.
+Include BOTH the primary indication AND any secondary/exploratory indications that have documented outcomes.
 
-=== CLASSIFICATION RULES ===
+Look at the trial title, trial ID, source URL, and any available information to identify every
+disease or condition this trial is investigating.
 
-"Primary" indication:
-- The drug's main approved or originally intended indication
-- The core disease the drug was designed and initially developed to treat
-- What appears on the original FDA/EMA approved label
-
-"Secondary" indication — must meet ALL of the following criteria:
-{SECONDARY_INDICATION_CRITERIA}
-
-=== THERAPY AREA ===
-Assign one of: Metabolic, Cardiovascular, Oncology, Neuroscience, Immunology,
-Respiratory, Nephrology, Hepatology, Ophthalmology, Musculoskeletal,
-Gastroenterology, Infectious Disease, Dermatology, Hematology, Rare Disease,
-or another appropriate broad therapeutic area.
-
-=== PATTERNS TO LOOK FOR ===
-- The trial title often contains the indication
+Common patterns to look for:
+- The trial title often contains the indication (e.g., "cardiovascular outcomes" → CV Risk Reduction)
 - "in subjects with type 2 diabetes" → T2DM
 - Trial acronyms like PIONEER, SUSTAIN, STEP, SELECT often indicate specific conditions
 - Outcome studies (e.g., cardiovascular, renal) count as indications
@@ -334,12 +426,8 @@ or another appropriate broad therapeutic area.
 Return ONLY valid JSON:
 {{
   "conditions": [
-    {{
-      "indication": "<disease or condition>",
-      "indication_type": "Primary" or "Secondary",
-      "therapy_area": "<broad therapeutic area>",
-      "rationale": "<why this indication was identified>"
-    }}
+    {{"indication": "<disease or condition>", "rationale": "<why this indication was identified>"}},
+    {{"indication": "<disease or condition>", "rationale": "<why>"}}
   ],
   "trial_title": "<trial title>"
 }}
@@ -347,7 +435,7 @@ Return ONLY valid JSON:
 Rules:
 - Include ALL indications the trial is evaluating — both primary and secondary
 - Always extract at least the primary indication from the trial title/details
-- Each indication must have indication_type, therapy_area, and rationale
+- Each indication must have a rationale
 - No explanations outside the JSON
 """
     try:
@@ -365,30 +453,20 @@ Rules:
         conditions  = data.get("conditions", [])
         trial_title = data.get("trial_title", "N/A")
 
-        # Normalize to list of dicts with all required fields
         if isinstance(conditions, list):
             normalized = []
             for c in conditions:
                 if isinstance(c, dict):
                     normalized.append({
-                        "indication":      (c.get("indication") or "").strip(),
-                        "indication_type": (c.get("indication_type") or "Secondary").strip(),
-                        "therapy_area":    (c.get("therapy_area") or "Other").strip(),
-                        "rationale":       (c.get("rationale") or "").strip(),
+                        "indication": (c.get("indication") or "").strip(),
+                        "rationale":  (c.get("rationale") or "").strip(),
                     })
                 elif isinstance(c, str) and c.strip():
-                    normalized.append({
-                        "indication":      c.strip(),
-                        "indication_type": "Secondary",
-                        "therapy_area":    "Other",
-                        "rationale":       "",
-                    })
+                    normalized.append({"indication": c.strip(), "rationale": ""})
             conditions = normalized
         else:
-            conditions = [{"indication": str(conditions), "indication_type": "Secondary",
-                           "therapy_area": "Other", "rationale": ""}]
+            conditions = [{"indication": str(conditions), "rationale": ""}]
 
-        # Deduplicate by indication
         seen, deduped = set(), []
         for c in conditions:
             key = c["indication"].lower()
@@ -397,7 +475,7 @@ Rules:
                 deduped.append(c)
         conditions = deduped
 
-        print(f"     ✅ {trial_id}: {', '.join(c['indication'] + ' (' + c['indication_type'] + ')' for c in conditions)}")
+        print(f"     ✅ {trial_id}: {', '.join(c['indication'] for c in conditions)}")
         with cp_lock:
             checkpoint[trial_id] = {"conditions": conditions, "trial_title": trial_title}
             save_checkpoint(cp_file, checkpoint)
@@ -424,7 +502,7 @@ def _gemini_enrich_trials(rows: list[dict], molecule_name: str,
     print(f"  📁 Checkpoint: {len(cp)} completed rows")
     print(f"  🚀 Processing {total} trials with {MAX_WORKERS_TRIALS} parallel workers…\n")
 
-    # ── Parallel enrichment ──────────────────────────────────────────────
+    # ── STEP 1: Parallel extraction ──────────────────────────────────────
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS_TRIALS) as executor:
         futures = {
@@ -442,37 +520,32 @@ def _gemini_enrich_trials(rows: list[dict], molecule_name: str,
                 print(f"     ❌ Unexpected: {row.get('trial_id')}: {e}")
                 results.append((row.get("trial_id"), [], str(e), row))
 
-    # ── Sort by original order ───────────────────────────────────────────
     trial_order = {row.get("trial_id"): i for i, row in enumerate(rows)}
     results.sort(key=lambda r: trial_order.get(r[0], 0))
 
-    # ── Unnest using LLM classification ──────────────────────────────────
+    # ── Unnest (no classification yet) ───────────────────────────────────
     flat = []
     for trial_id, conditions, trial_title, row in results:
         if not conditions:
             flat.append({
-                "molecule_name":   row.get("molecule_name"),
-                "company_name":    row.get("company_name"),
-                "indication":      "No indication found",
-                "rationale":       "",
-                "indication_type": "",
-                "therapy_area":    "",
-                "trial_title":     trial_title,
-                "trial_id":        trial_id,
-                "phase":           row.get("phase"),
-                "source_url":      row.get("source_url"),
-                "data_source":     data_source_label,
+                "molecule_name": row.get("molecule_name"),
+                "company_name":  row.get("company_name"),
+                "indication":    "No indication found",
+                "rationale":     "",
+                "trial_title":   trial_title,
+                "trial_id":      trial_id,
+                "phase":         row.get("phase"),
+                "source_url":    row.get("source_url"),
+                "data_source":   data_source_label,
             })
             continue
 
         seen = set()
         for c in conditions:
-            raw_indication = c.get("indication", "")
-            if not raw_indication:
+            raw = c.get("indication", "")
+            if not raw:
                 continue
-
-            # Light normalization
-            std = standardize_indication(raw_indication)
+            std = standardize_indication(raw)
             if not std or std.lower() in ("error", "n/a", "no indication found", "none"):
                 continue
             if std.lower() in seen:
@@ -480,25 +553,36 @@ def _gemini_enrich_trials(rows: list[dict], molecule_name: str,
             seen.add(std.lower())
 
             flat.append({
-                "molecule_name":   row.get("molecule_name"),
-                "company_name":    row.get("company_name"),
-                "indication":      std,
-                "rationale":       c.get("rationale", ""),
-                "indication_type": c.get("indication_type", "Secondary"),
-                "therapy_area":    c.get("therapy_area", "Other"),
-                "trial_title":     trial_title,
-                "trial_id":        trial_id,
-                "phase":           row.get("phase"),
-                "source_url":      row.get("source_url"),
-                "data_source":     data_source_label,
+                "molecule_name": row.get("molecule_name"),
+                "company_name":  row.get("company_name"),
+                "indication":    std,
+                "rationale":     c.get("rationale", ""),
+                "trial_title":   trial_title,
+                "trial_id":      trial_id,
+                "phase":         row.get("phase"),
+                "source_url":    row.get("source_url"),
+                "data_source":   data_source_label,
             })
 
-    # ── Compute Ep (row-wise) ────────────────────────────────────────────
+    # ── STEP 2: Classify via LLM + Search ────────────────────────────────
+    unique_indications = sorted(set(
+        r["indication"] for r in flat
+        if r["indication"] != "No indication found"
+    ))
+    classification_map = classify_indications_with_llm(
+        molecule_name, unique_indications, client, gen_types
+    )
+    for row in flat:
+        cls = classification_map.get(row["indication"].lower(), {})
+        row["indication_type"] = cls.get("indication_type", "")
+        row["therapy_area"]    = cls.get("therapy_area", "")
+
+    # ── STEP 3: Ep (row-wise) ────────────────────────────────────────────
     for row in flat:
         row["Ep"] = compute_ep(row.get("phase"))
 
-    # ── Compute Et (drug-level) ──────────────────────────────────────────
-    print(f"  🔹 Computing Et (drug-level expansion score)…")
+    # ── STEP 4: Et (drug-level) ──────────────────────────────────────────
+    print(f"  🔹 Computing Et…")
     et_value = compute_et(flat, molecule_name, client, gen_types)
     for row in flat:
         row["Et"] = et_value
@@ -509,7 +593,7 @@ def _gemini_enrich_trials(rows: list[dict], molecule_name: str,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MODULE A — label.py  (Clinical Efficacy)
+#  MODULE A — Clinical Efficacy
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_label(molecule: str) -> list[dict]:
@@ -522,7 +606,7 @@ def run_label(molecule: str) -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MODULE B — drug_indication_researcher.py
+#  MODULE B — Drug Indication Research (Innovator Sources)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _identify_company(molecule: str) -> str:
@@ -563,7 +647,7 @@ def _build_innovator_queries(molecule: str, company: str) -> list[dict]:
                 f'  {{"indication": "...", "brand_name": "...", "source_document": "<exact label title>", '
                 f'"phase": "Approved", "source_url": "...", '
                 f'"detail": "<approval year, population, dose>", '
-                f'"rationale": "<why this indication was identified — cite the specific label section or approval>"}}\n'
+                f'"rationale": "<why this indication was identified>"}}\n'
                 f"]}}\n"
                 f"source_document must be the REAL document title. No explanation, only JSON."
             ),
@@ -581,7 +665,7 @@ def _build_innovator_queries(molecule: str, company: str) -> list[dict]:
                 f'"phase": "<Phase 1/2/3/Filed/Approved/Launched>", '
                 f'"source_url": "...", '
                 f'"detail": "<specific claim from the presentation>", '
-                f'"rationale": "<why this indication was identified — cite the specific evidence>"}}\n'
+                f'"rationale": "<why this indication was identified>"}}\n'
                 f"]}}\n"
                 f"Only include indications with observed outcomes data. No explanation, only JSON."
             ),
@@ -598,7 +682,7 @@ def _build_innovator_queries(molecule: str, company: str) -> list[dict]:
                 f'"phase": "<Phase 1/2/3/Filed/Approved>", '
                 f'"source_url": "...", '
                 f'"detail": "<key announcement>", '
-                f'"rationale": "<why this indication was identified — cite the specific news or data>"}}\n'
+                f'"rationale": "<why this indication was identified>"}}\n'
                 f"]}}\n"
                 f"Only include indications backed by reported outcomes. No explanation, only JSON."
             ),
@@ -615,31 +699,29 @@ def _build_innovator_queries(molecule: str, company: str) -> list[dict]:
                 f'"phase": "<Preclinical/Phase 1/2/3/Filed/Approved>", '
                 f'"source_url": "...", '
                 f'"detail": "<status note>", '
-                f'"rationale": "<why this indication was identified — cite the pipeline entry>"}}\n'
+                f'"rationale": "<why this indication was identified>"}}\n'
                 f"]}}\n"
-                f"Exclude Preclinical entries (no human data). phase MUST be filled. No explanation, only JSON."
+                f"Exclude Preclinical entries. phase MUST be filled. No explanation, only JSON."
             ),
         },
         {
             "source_type": "SEC Filing",
             "prompt": (
-                f"Search the SEC EDGAR database and the web for SEC filings by {company} "
-                f"(10-K annual reports, 10-Q quarterly reports, 8-K current reports, "
-                f"20-F annual reports for foreign private issuers, 6-K reports) "
-                f"that disclose clinical or regulatory information about {molecule}.\n\n"
-                f"For EACH indication described with actual clinical data or regulatory outcomes "
-                f"in these filings, return a separate entry.\n\n"
+                f"Search SEC EDGAR for filings by {company} "
+                f"(10-K, 10-Q, 8-K, 20-F, 6-K) about {molecule}.\n\n"
+                f"For EACH indication with actual clinical data or regulatory outcomes, "
+                f"return a separate entry.\n\n"
                 f"Return ONLY valid JSON:\n"
                 f'{{"entries": [\n'
                 f'  {{"indication": "...", "brand_name": "...", '
-                f'"source_document": "<exact filing type and period, e.g. {company} 10-K FY2024>", '
+                f'"source_document": "<exact filing type and period>", '
                 f'"phase": "<Phase 1/2/3/Filed/Approved/Launched>", '
                 f'"source_url": "<SEC EDGAR URL>", '
-                f'"detail": "<specific disclosed data: trial outcome, milestone, MD&A section>", '
-                f'"rationale": "<why this indication was identified — cite the filing section and data>"}}\n'
+                f'"detail": "<specific disclosed data>", '
+                f'"rationale": "<why this indication was identified>"}}\n'
                 f"]}}\n"
-                f"Only include indications with actual results reported in the filing — "
-                f"not forward-looking statements or boilerplate risk factors. No explanation, only JSON."
+                f"Only indications with actual results — not forward-looking statements. "
+                f"No explanation, only JSON."
             ),
         },
     ]
@@ -658,9 +740,8 @@ def _research_single_source(q, molecule, company, client, gen_types):
                 tools=[gen_types.Tool(google_search=gen_types.GoogleSearch())],
                 system_instruction=(
                     "You are a pharmaceutical analyst researching what the "
-                    "innovator company publicly says about this drug, including SEC filings. "
-                    "Search the web and SEC EDGAR. Return ONLY valid JSON. "
-                    "Include indications with documented, verifiable clinical outcomes."
+                    "innovator company publicly says about this drug. "
+                    "Search the web and SEC EDGAR. Return ONLY valid JSON."
                 ),
             ),
         )
@@ -680,20 +761,13 @@ def _research_single_source(q, molecule, company, client, gen_types):
                 continue
             rationale = (e.get("rationale") or e.get("detail") or "").strip()
 
-            # ── LLM classification for innovator sources ─────────────────
-            # For innovator sources, we use a quick LLM call to classify
-            ind_type, therapy_area = _classify_single_indication_llm(
-                molecule, std, e.get("source_document", ""),
-                e.get("phase", ""), client, gen_types
-            )
-
             rows.append({
                 "molecule_name":   molecule.title(),
                 "company_name":    company,
                 "indication":      std,
                 "rationale":       rationale,
-                "indication_type": ind_type,
-                "therapy_area":    therapy_area,
+                "indication_type": "",   # filled later by classification
+                "therapy_area":    "",   # filled later by classification
                 "trial_title":     e.get("source_document", ""),
                 "trial_id":        e.get("brand_name", ""),
                 "phase":           e.get("phase", ""),
@@ -706,48 +780,6 @@ def _research_single_source(q, molecule, company, client, gen_types):
         print(f"     ❌ {source_type}: {ex}")
 
     return (source_type, rows)
-
-
-def _classify_single_indication_llm(molecule, indication, source_doc, phase,
-                                     client, gen_types):
-    """Quick LLM call to classify a single indication and assign therapy area."""
-    prompt = f"""
-You are a pharmaceutical analyst.
-
-Drug: {molecule}
-Indication: {indication}
-Source: {source_doc}
-Phase: {phase}
-
-1. Is this indication "Primary" or "Secondary" for this drug?
-   - Primary: the drug's main approved or originally intended indication
-   - Secondary: a label expansion beyond the primary indication
-
-2. What is the therapy area?
-   Choose from: Metabolic, Cardiovascular, Oncology, Neuroscience, Immunology,
-   Respiratory, Nephrology, Hepatology, Ophthalmology, Musculoskeletal,
-   Gastroenterology, Infectious Disease, Dermatology, Hematology, Rare Disease, Other
-
-Return ONLY valid JSON:
-{{"indication_type": "Primary" or "Secondary", "therapy_area": "<area>"}}
-"""
-    try:
-        resp = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=gen_types.GenerateContentConfig(
-                temperature=0,
-                system_instruction="Return ONLY valid JSON.",
-            ),
-        )
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp.text.strip()).strip()
-        data = json.loads(text)
-        return (
-            data.get("indication_type", "Secondary"),
-            data.get("therapy_area", "Other"),
-        )
-    except Exception:
-        return ("Secondary", "Other")
 
 
 def _innovator_research(molecule: str, company: str) -> list[dict]:
@@ -775,6 +807,7 @@ def _innovator_research(molecule: str, company: str) -> list[dict]:
             except Exception as ex:
                 print(f"     ❌ {source_type}: {ex}")
 
+    # Deduplicate
     seen, unique = set(), []
     for row in all_rows:
         key = (row["indication"], row["trial_title"], row["data_source"])
@@ -782,11 +815,21 @@ def _innovator_research(molecule: str, company: str) -> list[dict]:
             seen.add(key)
             unique.append(row)
 
-    # ── Compute Ep for innovator rows ────────────────────────────────────
+    # ── Classify via LLM + Search ────────────────────────────────────────
+    unique_indications = sorted(set(r["indication"] for r in unique))
+    classification_map = classify_indications_with_llm(
+        molecule, unique_indications, client, _types
+    )
+    for row in unique:
+        cls = classification_map.get(row["indication"].lower(), {})
+        row["indication_type"] = cls.get("indication_type", "")
+        row["therapy_area"]    = cls.get("therapy_area", "")
+
+    # ── Ep (row-wise) ────────────────────────────────────────────────────
     for row in unique:
         row["Ep"] = compute_ep(row.get("phase"))
 
-    # ── Compute Et (drug-level) ──────────────────────────────────────────
+    # ── Et (drug-level) ──────────────────────────────────────────────────
     if unique:
         print(f"  🔹 Computing Et for innovator rows…")
         et_value = compute_et(unique, molecule, client, _types)
@@ -807,7 +850,7 @@ def run_indication_researcher(molecule: str, company: str | None = None) -> list
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  EXCEL WRITER — common format for all sheets
+#  EXCEL WRITER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _thin_border():
@@ -821,7 +864,6 @@ def _write_standard_sheet(ws, rows: list[dict], molecule: str, sheet_title: str)
     alt_fill = PatternFill("solid", start_color="F4F7FB")
     ncols    = len(HEADERS)
 
-    # Title row
     ws.merge_cells(f"A1:{get_column_letter(ncols)}1")
     c           = ws["A1"]
     c.value     = f"{sheet_title}  —  {molecule.title()}"
@@ -829,7 +871,6 @@ def _write_standard_sheet(ws, rows: list[dict], molecule: str, sheet_title: str)
     c.alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[1].height = 32
 
-    # Subtitle row
     ws.merge_cells(f"A2:{get_column_letter(ncols)}2")
     c           = ws["A2"]
     c.value     = f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}   |   Rows: {len(rows)}"
@@ -837,7 +878,6 @@ def _write_standard_sheet(ws, rows: list[dict], molecule: str, sheet_title: str)
     c.alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[2].height = 16
 
-    # Header row
     for col, h in enumerate(HEADERS, 1):
         c           = ws.cell(row=3, column=col, value=h)
         c.font      = Font(name="Arial", bold=True, color="FFFFFF", size=10)
@@ -846,7 +886,6 @@ def _write_standard_sheet(ws, rows: list[dict], molecule: str, sheet_title: str)
         c.border    = thin
     ws.row_dimensions[3].height = 22
 
-    # Data rows
     for idx, row in enumerate(rows, start=4):
         fill = alt_fill if idx % 2 == 0 else None
         for col, key in enumerate(HEADERS, 1):
@@ -864,13 +903,8 @@ def _write_standard_sheet(ws, rows: list[dict], molecule: str, sheet_title: str)
         ws.column_dimensions[get_column_letter(i)].width = w
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  PER-MOLECULE EXCEL WRITER
-# ══════════════════════════════════════════════════════════════════════════════
-
 def write_molecule_excel(molecule: str, label_rows: list[dict],
                          indication_rows: list[dict], out_file: str):
-    """Write the 3-sheet Excel for a single molecule."""
     wb = openpyxl.Workbook()
 
     ws1       = wb.active
@@ -888,23 +922,13 @@ def write_molecule_excel(molecule: str, label_rows: list[dict],
     return combined
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  MASTER EXCEL WRITER  (one sheet per molecule + grand summary)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def write_master_excel(all_results: dict[str, list[dict]], out_file: str):
-    """
-    all_results: {molecule_name: [combined rows]}
-    Writes one sheet per molecule + a grand 'All Molecules' sheet.
-    """
     print(f"\n📊 Writing master file: {out_file}…")
     wb = openpyxl.Workbook()
-    wb.remove(wb.active)   # remove default empty sheet
+    wb.remove(wb.active)
 
     grand_rows = []
-
     for molecule, rows in all_results.items():
-        # Truncate sheet name to Excel's 31-char limit
         sheet_name = molecule.title()[:31]
         ws = wb.create_sheet(sheet_name)
         _write_standard_sheet(ws, rows, molecule, "All Sources")
@@ -921,9 +945,7 @@ def write_master_excel(all_results: dict[str, list[dict]], out_file: str):
 #  SINGLE-MOLECULE PIPELINE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def process_molecule(molecule: str, company: str | None = None,
-                     output_dir: str = ".") -> tuple[list[dict], list[dict]]:
-    """Run both modules for one molecule. Returns (label_rows, indication_rows)."""
+def process_molecule(molecule: str, company: str | None = None) -> tuple[list[dict], list[dict]]:
     label_rows      = run_label(molecule)
     indication_rows = run_indication_researcher(molecule, company)
     return label_rows, indication_rows
@@ -934,27 +956,30 @@ def process_molecule(molecule: str, company: str | None = None,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="Unified drug research pipeline → Excel")
-    group  = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--molecule", help="Single drug/molecule name, e.g. semaglutide")
-    group.add_argument(
-        "--drugs",
-        nargs="+",
-        metavar="DRUG",
-        help="One or more drug names, e.g. --drugs Semaglutide Liraglutide Tirzepatide",
+    parser = argparse.ArgumentParser(
+        description="Unified drug research pipeline → Excel",
+        usage="%(prog)s Semaglutide Tirzepatide  |  %(prog)s --all",
     )
-    group.add_argument("--all", action="store_true",
-                       help="Run pipeline for ALL distinct molecules in BigQuery")
+    parser.add_argument(
+        "molecules", nargs="*", default=[],
+        help="One or more drug/molecule names, e.g. Semaglutide Tirzepatide",
+    )
+    parser.add_argument(
+        "--all", action="store_true",
+        help="Run pipeline for ALL distinct molecules in BigQuery",
+    )
     parser.add_argument("--company", default=None,
-                        help="Innovator company (only used with --molecule)")
+                        help="Innovator company (only used with a single molecule)")
     parser.add_argument("--output-dir", default=".",
                         help="Directory to write output files (default: current dir)")
     parser.add_argument("--skip-existing", action="store_true",
-                        help="(--all / --drugs mode) skip molecules whose Excel file already exists")
+                        help="(--all mode) skip molecules whose Excel file already exists")
     parser.add_argument("--master-file", default=None,
-                        help="(--all mode) filename for the master combined Excel "
-                             "(default: all_molecules_research_<timestamp>.xlsx)")
+                        help="Filename for the master combined Excel")
     args = parser.parse_args()
+
+    if not args.molecules and not args.all:
+        parser.error("Provide at least one molecule name, or use --all")
 
     if not GEMINI_API_KEY:
         sys.exit("❌  GEMINI_API_KEY not set in .env")
@@ -962,98 +987,20 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── SINGLE-MOLECULE MODE ──────────────────────────────────────────────
-    if args.molecule:
-        molecule = args.molecule.strip()
-        slug     = molecule.lower().replace(" ", "_")
-        out_file = output_dir / f"{slug}_research.xlsx"
+    # ── Build the molecule list ──────────────────────────────────────────
+    if args.all:
+        molecules = fetch_all_molecules()
+        if not molecules:
+            sys.exit("❌  No molecules found in BigQuery.")
+    else:
+        molecules = [m.strip() for m in args.molecules if m.strip()]
 
-        print(f"\n{'━'*62}")
-        print(f"  Molecule : {molecule.title()}")
-        print(f"  Output   : {out_file}")
-        print(f"{'━'*62}")
+    total = len(molecules)
 
-        label_rows, indication_rows = process_molecule(molecule, args.company)
-        combined = write_molecule_excel(molecule, label_rows, indication_rows, str(out_file))
-
-        print(f"\n✅  Done!")
-        print(f"📄  File   : {out_file}")
-        print(f"📊  Sheets : Clinical Efficacy ({len(label_rows)}) | "
-              f"Drug Indication Research ({len(indication_rows)}) | "
-              f"All Combined ({len(combined)})")
-        return
-
-    # ── MULTI-DRUG MODE  (--drugs) ────────────────────────────────────────
-    if args.drugs:
-        molecules = [m.strip() for m in args.drugs if m.strip()]
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        slug      = "_".join(m.lower().replace(" ", "_") for m in molecules[:3])
-        if len(molecules) > 3:
-            slug += f"_and_{len(molecules) - 3}_more"
-        master_file = args.master_file or f"{slug}_research_{timestamp}.xlsx"
-        master_path = output_dir / master_file
-
-        print(f"\n{'━'*62}")
-        print(f"  Mode     : MULTI-DRUG  ({len(molecules)} drugs)")
-        print(f"  Drugs    : {', '.join(m.title() for m in molecules)}")
-        print(f"  Output   : {output_dir}")
-        print(f"  Master   : {master_path}")
-        print(f"{'━'*62}\n")
-
-        all_results: dict[str, list[dict]] = {}
-        failed:      list[str]             = []
-
-        total = len(molecules)
-        for i, molecule in enumerate(molecules, 1):
-            slug     = molecule.lower().replace(" ", "_")
-            out_file = output_dir / f"{slug}_research.xlsx"
-
-            print(f"\n{'═'*62}")
-            print(f"  [{i}/{total}] {molecule.title()}")
-            print(f"{'═'*62}")
-
-            if args.skip_existing and out_file.exists():
-                print(f"  ⏭️  Skipping — file already exists: {out_file}")
-                all_results[molecule] = []
-                continue
-
-            try:
-                label_rows, indication_rows = process_molecule(molecule)
-                combined = write_molecule_excel(molecule, label_rows, indication_rows, str(out_file))
-                all_results[molecule] = combined
-
-                print(f"\n  ✅ {molecule.title()} done → {out_file}")
-                print(f"     Clinical Efficacy: {len(label_rows)} | "
-                      f"Indication Research: {len(indication_rows)} | "
-                      f"Combined: {len(combined)}")
-            except Exception as e:
-                print(f"\n  ❌ FAILED: {molecule} — {e}")
-                failed.append(molecule)
-                all_results[molecule] = []
-
-        write_master_excel(all_results, str(master_path))
-
-        print(f"\n{'━'*62}")
-        print(f"  Pipeline complete!")
-        print(f"  Drugs processed : {total}")
-        print(f"  Succeeded       : {total - len(failed)}")
-        print(f"  Failed          : {len(failed)}")
-        if failed:
-            print(f"  Failed drugs    : {', '.join(failed)}")
-        print(f"  Master file     : {master_path}")
-        print(f"  Per-drug files  : {output_dir}/<drug>_research.xlsx")
-        print(f"{'━'*62}\n")
-        return
-
-    # ── ALL-MOLECULES MODE ────────────────────────────────────────────────
     print(f"\n{'━'*62}")
-    print(f"  Mode     : ALL MOLECULES")
-    print(f"  Output   : {output_dir}")
+    print(f"  Molecules : {', '.join(m.title() for m in molecules)}")
+    print(f"  Output    : {output_dir}")
     print(f"{'━'*62}\n")
-
-    molecules = fetch_all_molecules()
-    if not molecules:
-        sys.exit("❌  No molecules found in BigQuery.")
 
     timestamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
     master_file  = args.master_file or f"all_molecules_research_{timestamp}.xlsx"
@@ -1062,7 +1009,6 @@ def main():
     all_results: dict[str, list[dict]] = {}
     failed:      list[str]             = []
 
-    total = len(molecules)
     for i, molecule in enumerate(molecules, 1):
         slug     = molecule.lower().replace(" ", "_")
         out_file = output_dir / f"{slug}_research.xlsx"
@@ -1071,10 +1017,8 @@ def main():
         print(f"  [{i}/{total}] {molecule.title()}")
         print(f"{'═'*62}")
 
-        # Skip if already done
         if args.skip_existing and out_file.exists():
             print(f"  ⏭️  Skipping — file already exists: {out_file}")
-            # Still try to load existing combined rows for the master file
             try:
                 wb_existing = openpyxl.load_workbook(str(out_file), read_only=True, data_only=True)
                 ws_comb = wb_existing["All Combined"]
@@ -1094,7 +1038,8 @@ def main():
             continue
 
         try:
-            label_rows, indication_rows = process_molecule(molecule)
+            company = args.company if (args.company and total == 1) else None
+            label_rows, indication_rows = process_molecule(molecule, company)
             combined = write_molecule_excel(molecule, label_rows, indication_rows, str(out_file))
             all_results[molecule] = combined
 
@@ -1108,8 +1053,9 @@ def main():
             failed.append(molecule)
             all_results[molecule] = []
 
-    # Write master file
-    write_master_excel(all_results, str(master_path))
+    # Write master file only when processing multiple molecules
+    if total > 1:
+        write_master_excel(all_results, str(master_path))
 
     # Summary
     print(f"\n{'━'*62}")
@@ -1119,7 +1065,8 @@ def main():
     print(f"  Failed              : {len(failed)}")
     if failed:
         print(f"  Failed molecules    : {', '.join(failed)}")
-    print(f"  Master file         : {master_path}")
+    if total > 1:
+        print(f"  Master file         : {master_path}")
     print(f"  Per-molecule files  : {output_dir}/<molecule>_research.xlsx")
     print(f"{'━'*62}\n")
 
