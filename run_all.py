@@ -24,6 +24,9 @@ Usage:
     python run_all.py --molecule semaglutide
     python run_all.py --molecule semaglutide --company "Novo Nordisk"
 
+    # Multiple selected molecules
+    python run_all.py --drugs Semaglutide Liraglutide Tirzepatide
+
     # All molecules in BigQuery (one Excel file per molecule + a master file)
     python run_all.py --all
     python run_all.py --all --skip-existing   # skip molecules already processed
@@ -934,6 +937,12 @@ def main():
     parser = argparse.ArgumentParser(description="Unified drug research pipeline → Excel")
     group  = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--molecule", help="Single drug/molecule name, e.g. semaglutide")
+    group.add_argument(
+        "--drugs",
+        nargs="+",
+        metavar="DRUG",
+        help="One or more drug names, e.g. --drugs Semaglutide Liraglutide Tirzepatide",
+    )
     group.add_argument("--all", action="store_true",
                        help="Run pipeline for ALL distinct molecules in BigQuery")
     parser.add_argument("--company", default=None,
@@ -941,7 +950,7 @@ def main():
     parser.add_argument("--output-dir", default=".",
                         help="Directory to write output files (default: current dir)")
     parser.add_argument("--skip-existing", action="store_true",
-                        help="(--all mode) skip molecules whose Excel file already exists")
+                        help="(--all / --drugs mode) skip molecules whose Excel file already exists")
     parser.add_argument("--master-file", default=None,
                         help="(--all mode) filename for the master combined Excel "
                              "(default: all_molecules_research_<timestamp>.xlsx)")
@@ -972,6 +981,68 @@ def main():
         print(f"📊  Sheets : Clinical Efficacy ({len(label_rows)}) | "
               f"Drug Indication Research ({len(indication_rows)}) | "
               f"All Combined ({len(combined)})")
+        return
+
+    # ── MULTI-DRUG MODE  (--drugs) ────────────────────────────────────────
+    if args.drugs:
+        molecules = [m.strip() for m in args.drugs if m.strip()]
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        slug      = "_".join(m.lower().replace(" ", "_") for m in molecules[:3])
+        if len(molecules) > 3:
+            slug += f"_and_{len(molecules) - 3}_more"
+        master_file = args.master_file or f"{slug}_research_{timestamp}.xlsx"
+        master_path = output_dir / master_file
+
+        print(f"\n{'━'*62}")
+        print(f"  Mode     : MULTI-DRUG  ({len(molecules)} drugs)")
+        print(f"  Drugs    : {', '.join(m.title() for m in molecules)}")
+        print(f"  Output   : {output_dir}")
+        print(f"  Master   : {master_path}")
+        print(f"{'━'*62}\n")
+
+        all_results: dict[str, list[dict]] = {}
+        failed:      list[str]             = []
+
+        total = len(molecules)
+        for i, molecule in enumerate(molecules, 1):
+            slug     = molecule.lower().replace(" ", "_")
+            out_file = output_dir / f"{slug}_research.xlsx"
+
+            print(f"\n{'═'*62}")
+            print(f"  [{i}/{total}] {molecule.title()}")
+            print(f"{'═'*62}")
+
+            if args.skip_existing and out_file.exists():
+                print(f"  ⏭️  Skipping — file already exists: {out_file}")
+                all_results[molecule] = []
+                continue
+
+            try:
+                label_rows, indication_rows = process_molecule(molecule)
+                combined = write_molecule_excel(molecule, label_rows, indication_rows, str(out_file))
+                all_results[molecule] = combined
+
+                print(f"\n  ✅ {molecule.title()} done → {out_file}")
+                print(f"     Clinical Efficacy: {len(label_rows)} | "
+                      f"Indication Research: {len(indication_rows)} | "
+                      f"Combined: {len(combined)}")
+            except Exception as e:
+                print(f"\n  ❌ FAILED: {molecule} — {e}")
+                failed.append(molecule)
+                all_results[molecule] = []
+
+        write_master_excel(all_results, str(master_path))
+
+        print(f"\n{'━'*62}")
+        print(f"  Pipeline complete!")
+        print(f"  Drugs processed : {total}")
+        print(f"  Succeeded       : {total - len(failed)}")
+        print(f"  Failed          : {len(failed)}")
+        if failed:
+            print(f"  Failed drugs    : {', '.join(failed)}")
+        print(f"  Master file     : {master_path}")
+        print(f"  Per-drug files  : {output_dir}/<drug>_research.xlsx")
+        print(f"{'━'*62}\n")
         return
 
     # ── ALL-MOLECULES MODE ────────────────────────────────────────────────
