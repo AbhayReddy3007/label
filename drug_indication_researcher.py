@@ -124,7 +124,6 @@ def _build_queries(molecule: str, company: str) -> list[dict]:
                 f'    "indication": "<disease or condition>",\n'
                 f'    "brand_name": "<commercial brand name, e.g. Ozempic, Wegovy>",\n'
                 f'    "source_document": "<exact label title, e.g. Ozempic FDA Prescribing Information>",\n'
-                f'    "phase": "Approved",\n'
                 f'    "source_url": "<URL to the label or DailyMed page>",\n'
                 f'    "detail": "<approval year, patient population, dose>",\n'
                 f'    "rationale": "<why this indication was identified — cite the specific label section or approval>"\n'
@@ -153,7 +152,6 @@ def _build_queries(molecule: str, company: str) -> list[dict]:
                 f'    "indication": "<disease or condition>",\n'
                 f'    "brand_name": "<brand name if mentioned>",\n'
                 f'    "source_document": "<exact presentation title, e.g. Novo Nordisk Capital Markets Day 2024>",\n'
-                f'    "phase": "<Phase 1 / Phase 2 / Phase 3 / Filed / Approved / Launched>",\n'
                 f'    "source_url": "<URL to the presentation PDF or page>",\n'
                 f'    "detail": "<specific claim, trial name, or pipeline status from the slide>",\n'
                 f'    "rationale": "<why this indication was identified — cite the specific evidence from the presentation>"\n'
@@ -182,7 +180,6 @@ def _build_queries(molecule: str, company: str) -> list[dict]:
                 f'    "indication": "<disease or condition>",\n'
                 f'    "brand_name": "<brand name if mentioned>",\n'
                 f'    "source_document": "<exact press release title or earnings call date>",\n'
-                f'    "phase": "<Phase 1 / Phase 2 / Phase 3 / Filed / Approved / Launched>",\n'
                 f'    "source_url": "<URL to the press release>",\n'
                 f'    "detail": "<key announcement: approval, trial result, filing, etc.>",\n'
                 f'    "rationale": "<why this indication was identified — cite the specific news or data>"\n'
@@ -209,15 +206,13 @@ def _build_queries(molecule: str, company: str) -> list[dict]:
                 f'    "indication": "<disease or condition>",\n'
                 f'    "brand_name": "<brand name if shown>",\n'
                 f'    "source_document": "<e.g. Novo Nordisk Pipeline — as of Q1 2025>",\n'
-                f'    "phase": "<Preclinical / Phase 1 / Phase 2 / Phase 3 / Filed / Approved>",\n'
                 f'    "source_url": "<URL to the pipeline page>",\n'
                 f'    "detail": "<any additional status note from the pipeline>",\n'
                 f'    "rationale": "<why this indication was identified — cite the pipeline entry>"\n'
                 f"  }}\n"
                 f"]}}\n\n"
                 f"IMPORTANT:\n"
-                f"- One entry per indication × phase combination\n"
-                f"- phase MUST be filled with the development stage shown on the pipeline\n"
+                f"- One entry per indication\n"
                 f"- Exclude Preclinical and early discovery entries (no human data)\n"
                 f"- No explanation, only JSON"
             ),
@@ -239,7 +234,6 @@ def _build_queries(molecule: str, company: str) -> list[dict]:
                 f'    "indication": "<disease or condition>",\n'
                 f'    "brand_name": "<brand name if mentioned>",\n'
                 f'    "source_document": "<exact filing type and period, e.g. {company} 10-K FY2024, {company} 8-K dated 2024-03-15>",\n'
-                f'    "phase": "<Phase 1 / Phase 2 / Phase 3 / Filed / Approved / Launched>",\n'
                 f'    "source_url": "<URL to the SEC EDGAR filing or press release>",\n'
                 f'    "detail": "<specific disclosed data: trial outcome, milestone, risk factor, MD&A discussion>",\n'
                 f'    "rationale": "<why this indication was identified — cite the filing section and data>"\n'
@@ -321,7 +315,7 @@ def _research_single_source(q, molecule, company):
                 "therapy_area":    get_therapy_area(std_indication),
                 "trial_title":     e.get("source_document", ""),
                 "trial_id":        e.get("brand_name", ""),
-                "phase":           e.get("phase", ""),
+                "phase":           "",
                 "source_url":      e.get("source_url", ""),
                 "data_source":     f"Innovator: {source_type}",
             })
