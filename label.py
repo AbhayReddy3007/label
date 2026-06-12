@@ -122,6 +122,53 @@ def _gemini_generate(client, gen_types, prompt, *, system_instruction="",
                 raise
     return ""
 
+
+def _extract_json(text: str) -> dict | list:
+    """Extract and parse the first JSON object or array from *text*,
+    even if surrounded by prose, markdown fences, or whitespace."""
+    if not text:
+        raise ValueError("Cannot extract JSON from empty text")
+
+    # 1. Direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 2. Strip markdown fences
+    stripped = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
+    stripped = re.sub(r"\s*```\s*$", "", stripped, flags=re.MULTILINE).strip()
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    # 3. Bracket-match the first { … } or [ … ]
+    for open_ch, close_ch in (("{", "}"), ("[", "]")):
+        start = stripped.find(open_ch)
+        if start == -1:
+            continue
+        depth, end = 0, start
+        in_str = False
+        while end < len(stripped):
+            ch = stripped[end]
+            if ch == '"' and (end == 0 or stripped[end - 1] != '\\'):
+                in_str = not in_str
+            elif not in_str:
+                if ch == open_ch:
+                    depth += 1
+                elif ch == close_ch:
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(stripped[start:end + 1])
+                        except json.JSONDecodeError:
+                            break
+            end += 1
+
+    raise ValueError(f"No valid JSON found in response (first 200 chars): {text[:200]}")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  PARALLEL CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
@@ -275,9 +322,7 @@ Return ONLY valid JSON — no markdown fences, no explanation:
             ),
             use_search=True,
         )
-        if not text:
-            raise ValueError("Empty response from Gemini after retry")
-        data = json.loads(text)
+        data = _extract_json(text)
         classifications = data.get("classifications", [])
 
         result = {}
@@ -408,7 +453,7 @@ No explanation.
         )
         if not text:
             return False
-        data = json.loads(text)
+        data = _extract_json(text)
         return data.get("is_niche", False)
     except Exception as e:
         print(f"   ⚠️  Niche check failed: {e} — defaulting to non-niche")
@@ -510,9 +555,7 @@ Rules:
             raise error_holder["error"]
         else:
             text = result_holder.get("text", "")
-            if not text:
-                raise ValueError("Empty response from Gemini")
-            data        = json.loads(text)
+            data        = _extract_json(text)
             conditions  = data.get("conditions", [])
             trial_title = data.get("trial_title", "N/A")
 
