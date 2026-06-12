@@ -40,6 +40,26 @@ GBQ_SERVICE_KEY = os.getenv(
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
+
+def _safe_response_text(resp) -> str:
+    """Safely extract text from a Gemini response.
+    With Google Search grounding, resp.text can be None — the content
+    lives in resp.candidates[0].content.parts instead."""
+    try:
+        if resp.text is not None:
+            return resp.text.strip()
+    except Exception:
+        pass
+    # Fallback: walk the candidates / parts structure
+    try:
+        for candidate in resp.candidates:
+            for part in candidate.content.parts:
+                if hasattr(part, "text") and part.text:
+                    return part.text.strip()
+    except Exception:
+        pass
+    return ""
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  PARALLEL CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
@@ -197,7 +217,7 @@ Return ONLY valid JSON — no markdown fences, no explanation:
                 ),
             ),
         )
-        text = resp.text.strip()
+        text = _safe_response_text(resp)
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
         data = json.loads(text)
         classifications = data.get("classifications", [])
@@ -332,7 +352,7 @@ No explanation.
                 system_instruction="Return ONLY valid JSON.",
             ),
         )
-        text = resp.text.strip()
+        text = _safe_response_text(resp)
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
         data = json.loads(text)
         return data.get("is_niche", False)
@@ -440,7 +460,7 @@ Rules:
             raise error_holder["error"]
         else:
             response    = result_holder["response"]
-            text        = response.text.strip()
+            text        = _safe_response_text(response)
             text        = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
             data        = json.loads(text)
             conditions  = data.get("conditions", [])
