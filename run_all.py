@@ -133,6 +133,49 @@ def _gemini_generate(client, gen_types, prompt, *, system_instruction="",
     return ""
 
 
+def _extract_json(text: str) -> dict | list:
+    """Extract and parse the first JSON object or array from *text*,
+    even if surrounded by prose, markdown fences, or whitespace."""
+    if not text:
+        raise ValueError("Cannot extract JSON from empty text")
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    stripped = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
+    stripped = re.sub(r"\s*```\s*$", "", stripped, flags=re.MULTILINE).strip()
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    for open_ch, close_ch in (("{", "}"), ("[", "]")):
+        start = stripped.find(open_ch)
+        if start == -1:
+            continue
+        depth, end = 0, start
+        in_str = False
+        while end < len(stripped):
+            ch = stripped[end]
+            if ch == '"' and (end == 0 or stripped[end - 1] != '\\'):
+                in_str = not in_str
+            elif not in_str:
+                if ch == open_ch:
+                    depth += 1
+                elif ch == close_ch:
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(stripped[start:end + 1])
+                        except json.JSONDecodeError:
+                            break
+            end += 1
+
+    raise ValueError(f"No valid JSON found in response (first 200 chars): {text[:200]}")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  SECONDARY INDICATION CRITERIA
 # ══════════════════════════════════════════════════════════════════════════════
@@ -261,7 +304,7 @@ Return ONLY valid JSON — no markdown fences, no explanation:
         )
         if not text:
             raise ValueError("Empty response from Gemini after retry")
-        data = json.loads(text)
+        data = _extract_json(text)
         classifications = data.get("classifications", [])
 
         result = {}
@@ -387,7 +430,7 @@ No explanation.
         )
         if not text:
             return False
-        data = json.loads(text)
+        data = _extract_json(text)
         return data.get("is_niche", False)
     except Exception as e:
         print(f"     ⚠️  Niche check failed: {e} — defaulting to non-niche")
@@ -529,7 +572,7 @@ Rules:
         )
         if not text:
             raise ValueError("Empty response from Gemini")
-        data = json.loads(text)
+        data = _extract_json(text)
         conditions  = data.get("conditions", [])
         trial_title = data.get("trial_title", "N/A")
 
@@ -712,7 +755,7 @@ def _identify_company(molecule: str) -> str:
         )
         if not text:
             return ""
-        data = json.loads(text)
+        data = _extract_json(text)
         company = data.get("company", "")
         print(f"  🏢 Auto-detected innovator: {company}")
         return company
@@ -825,7 +868,7 @@ def _research_single_source(q, molecule, company, client, gen_types):
         if not text:
             print(f"     ⚠️  {source_type}: Empty response")
             return (source_type, [])
-        entries = json.loads(text).get("entries", [])
+        entries = _extract_json(text).get("entries", [])
         if not entries:
             print(f"     ⚠️  {source_type}: No entries")
             return (source_type, [])
