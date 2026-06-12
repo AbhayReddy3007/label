@@ -88,12 +88,6 @@ def _safe_response_text(resp) -> str:
         pass
     if texts:
         return "\n".join(texts)
-    try:
-        s = str(resp)
-        if s and len(s) > 10:
-            return s.strip()
-    except Exception:
-        pass
     return ""
 
 
