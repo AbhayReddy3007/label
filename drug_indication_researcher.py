@@ -51,11 +51,28 @@ def _safe_response_text(resp) -> str:
             return resp.text.strip()
     except Exception:
         pass
+    texts = []
     try:
-        for candidate in resp.candidates:
-            for part in candidate.content.parts:
-                if hasattr(part, "text") and part.text:
-                    return part.text.strip()
+        for candidate in (resp.candidates or []):
+            try:
+                parts = candidate.content.parts
+            except Exception:
+                continue
+            for part in (parts or []):
+                try:
+                    t = getattr(part, "text", None)
+                    if t:
+                        texts.append(t.strip())
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    if texts:
+        return "\n".join(texts)
+    try:
+        s = str(resp)
+        if s and len(s) > 10:
+            return s.strip()
     except Exception:
         pass
     return ""
@@ -111,6 +128,8 @@ def identify_company(molecule: str) -> str:
         )
         text = _safe_response_text(resp)
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+        if not text:
+            raise ValueError("Empty response from Gemini")
         data = json.loads(text)
         company = data.get("company", "")
         brands  = data.get("brand_names", [])
@@ -301,6 +320,8 @@ def _research_single_source(q, molecule, company):
 
         text = _safe_response_text(response)
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+        if not text:
+            raise ValueError(f"Empty response from Gemini for {source_type}")
         data    = json.loads(text)
         entries = data.get("entries", [])
 
@@ -405,6 +426,8 @@ def _fallback_extract(molecule, company, source_type, raw_text, all_rows):
         )
         text = _safe_response_text(resp)
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+        if not text:
+            return
         parsed = json.loads(text)
         if isinstance(parsed, list):
             for raw in parsed:
