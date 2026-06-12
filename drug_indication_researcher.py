@@ -42,6 +42,24 @@ load_dotenv(override=True)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 gemini_client  = genai.Client(api_key=GEMINI_API_KEY)
 
+
+def _safe_response_text(resp) -> str:
+    """Safely extract text from a Gemini response.
+    With Google Search grounding, resp.text can be None."""
+    try:
+        if resp.text is not None:
+            return resp.text.strip()
+    except Exception:
+        pass
+    try:
+        for candidate in resp.candidates:
+            for part in candidate.content.parts:
+                if hasattr(part, "text") and part.text:
+                    return part.text.strip()
+    except Exception:
+        pass
+    return ""
+
 # ── Parallel config ───────────────────────────────────────────────────────────
 MAX_WORKERS = 5  # parallel Gemini calls for innovator source queries
 
@@ -91,7 +109,7 @@ def identify_company(molecule: str) -> str:
                 system_instruction="Return ONLY valid JSON. No markdown fences.",
             ),
         )
-        text = resp.text.strip()
+        text = _safe_response_text(resp)
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
         data = json.loads(text)
         company = data.get("company", "")
@@ -281,7 +299,7 @@ def _research_single_source(q, molecule, company):
             ),
         )
 
-        text = response.text.strip()
+        text = _safe_response_text(response)
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
         data    = json.loads(text)
         entries = data.get("entries", [])
@@ -385,7 +403,7 @@ def _fallback_extract(molecule, company, source_type, raw_text, all_rows):
                 system_instruction="Return ONLY a JSON array of strings.",
             ),
         )
-        text = resp.text.strip()
+        text = _safe_response_text(resp)
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
         parsed = json.loads(text)
         if isinstance(parsed, list):
