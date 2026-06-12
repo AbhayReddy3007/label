@@ -77,6 +77,45 @@ def _safe_response_text(resp) -> str:
         pass
     return ""
 
+
+def _extract_json(text: str) -> dict | list:
+    """Extract and parse the first JSON object or array from *text*."""
+    if not text:
+        raise ValueError("Cannot extract JSON from empty text")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    stripped = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
+    stripped = re.sub(r"\s*```\s*$", "", stripped, flags=re.MULTILINE).strip()
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+    for open_ch, close_ch in (("{", "}"), ("[", "]")):
+        start = stripped.find(open_ch)
+        if start == -1:
+            continue
+        depth, end = 0, start
+        in_str = False
+        while end < len(stripped):
+            ch = stripped[end]
+            if ch == '"' and (end == 0 or stripped[end - 1] != '\\'):
+                in_str = not in_str
+            elif not in_str:
+                if ch == open_ch:
+                    depth += 1
+                elif ch == close_ch:
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(stripped[start:end + 1])
+                        except json.JSONDecodeError:
+                            break
+            end += 1
+    raise ValueError(f"No valid JSON found (first 200 chars): {text[:200]}")
+
+
 # ── Parallel config ───────────────────────────────────────────────────────────
 MAX_WORKERS = 5  # parallel Gemini calls for innovator source queries
 
@@ -130,7 +169,7 @@ def identify_company(molecule: str) -> str:
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
         if not text:
             raise ValueError("Empty response from Gemini")
-        data = json.loads(text)
+        data = _extract_json(text)
         company = data.get("company", "")
         brands  = data.get("brand_names", [])
         print(f"  🏢 Innovator   : {company}")
@@ -322,7 +361,7 @@ def _research_single_source(q, molecule, company):
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
         if not text:
             raise ValueError(f"Empty response from Gemini for {source_type}")
-        data    = json.loads(text)
+        data    = _extract_json(text)
         entries = data.get("entries", [])
 
         if not entries:
@@ -428,7 +467,7 @@ def _fallback_extract(molecule, company, source_type, raw_text, all_rows):
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
         if not text:
             return
-        parsed = json.loads(text)
+        parsed = _extract_json(text)
         if isinstance(parsed, list):
             for raw in parsed:
                 std = standardize_indication(str(raw))
