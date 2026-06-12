@@ -364,32 +364,43 @@ Trial ID: {trial_id}
 Phase: {row.get('phase')}
 Source URL: {row.get('source_url')}
 
-Your task: Extract ALL disease indications being studied in this clinical trial.
-Include BOTH the primary indication AND any secondary/exploratory indications that have documented outcomes.
+═══ STEP 1 — Look up the trial ═══
+Search for this trial using the Trial ID "{trial_id}" on ClinicalTrials.gov
+or other clinical trial registries (e.g. EudraCT, WHO ICTRP).
+Find the EXACT official trial title as registered.
 
-Look at the trial title, trial ID, source URL, and any available information to identify every
-disease or condition this trial is investigating.
+If the source URL is provided, also check that URL for the trial title.
 
-Common patterns to look for:
-- The trial title often contains the indication (e.g., "cardiovascular outcomes" → CV Risk Reduction)
+═══ STEP 2 — Extract indications ═══
+From the trial record, extract ALL disease indications being studied.
+Include BOTH the primary indication AND any secondary/exploratory indications
+that have documented outcomes.
+
+Look at:
+- The official trial title (most reliable source of the indication)
+- The trial's "Conditions" or "Diseases" field on the registry
+- Primary and secondary outcome measures
+- The trial description / brief summary
+
+Common patterns:
 - "in subjects with type 2 diabetes" → T2DM
-- Trial acronyms like PIONEER, SUSTAIN, STEP, SELECT often indicate specific conditions
+- "cardiovascular outcomes" → CV Risk Reduction
+- Trial acronyms like PIONEER, SUSTAIN, STEP, SELECT often indicate specific programs
 - Outcome studies (e.g., cardiovascular, renal) count as indications
 
 Return ONLY valid JSON:
 {{
   "conditions": [
-    {{"indication": "<disease or condition>", "rationale": "<why this indication was identified — cite the specific evidence from trial title, ID, or known trial data>"}},
+    {{"indication": "<disease or condition>", "rationale": "<why — cite the trial record field>"}},
     {{"indication": "<disease or condition>", "rationale": "<why>"}}
   ],
-  "trial_title": "<trial title>"
+  "trial_title": "<EXACT official trial title as registered on the clinical trial registry>"
 }}
 
 Rules:
-- Include ALL indications the trial is evaluating — both primary and secondary
-- Always extract at least the primary indication from the trial title/details
-- Each indication must have a rationale explaining what evidence led to its identification
-- If the trial title mentions a condition (e.g., "type 2 diabetes", "cardiovascular outcomes"), that IS an indication — extract it
+- trial_title must be the EXACT title from the registry, not a summary or guess
+- Include ALL indications the trial is evaluating
+- Always extract at least the primary indication
 - No explanations outside the JSON
 """
     try:
@@ -405,7 +416,12 @@ Rules:
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         temperature=0,
-                        system_instruction="Return ONLY valid JSON output"
+                        tools=[types.Tool(google_search=types.GoogleSearch())],
+                        system_instruction=(
+                            "You are a clinical trial data assistant. "
+                            "Search for the trial on ClinicalTrials.gov or other registries "
+                            "to get the exact title. Return ONLY valid JSON."
+                        ),
                     ),
                 )
                 result_holder["response"] = resp
@@ -414,10 +430,10 @@ Rules:
 
         thread = threading.Thread(target=_call_gemini, daemon=True)
         thread.start()
-        thread.join(timeout=60)
+        thread.join(timeout=90)
 
         if thread.is_alive():
-            print(f"   ⏱️  Timeout (>60s) — skipping trial {trial_id}")
+            print(f"   ⏱️  Timeout (>90s) — skipping trial {trial_id}")
             conditions  = []
             trial_title = "Skipped (timeout)"
         elif "error" in error_holder:
@@ -556,6 +572,12 @@ def enrich_with_gemini(rows, molecule_name):
         row["indication_type"] = cls.get("indication_type", "")
         row["therapy_area"]    = cls.get("therapy_area", "")
         row["rationale"]       = cls.get("rationale", "")
+
+    # Override: Primary + non-Metabolic therapy area → Secondary
+    for row in flat_rows:
+        if (row.get("indication_type", "").lower() == "primary"
+                and row.get("therapy_area", "").lower() != "metabolic"):
+            row["indication_type"] = "Secondary"
 
     # ── STEP 3: Compute Ep (row-wise) ────────────────────────────────────
     for row in flat_rows:
