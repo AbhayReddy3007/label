@@ -76,14 +76,6 @@ def _safe_response_text(resp) -> str:
     if texts:
         return "\n".join(texts)
 
-    # ── Last resort: cast the whole response ──────────────────────────────
-    try:
-        s = str(resp)
-        if s and len(s) > 10:
-            return s.strip()
-    except Exception:
-        pass
-
     return ""
 
 
