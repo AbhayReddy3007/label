@@ -63,6 +63,25 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 
+def _safe_response_text(resp) -> str:
+    """Safely extract text from a Gemini response.
+    With Google Search grounding, resp.text can be None — the content
+    lives in resp.candidates[0].content.parts instead."""
+    try:
+        if resp.text is not None:
+            return resp.text.strip()
+    except Exception:
+        pass
+    try:
+        for candidate in resp.candidates:
+            for part in candidate.content.parts:
+                if hasattr(part, "text") and part.text:
+                    return part.text.strip()
+    except Exception:
+        pass
+    return ""
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  SECONDARY INDICATION CRITERIA
 # ══════════════════════════════════════════════════════════════════════════════
@@ -193,7 +212,7 @@ Return ONLY valid JSON — no markdown fences, no explanation:
                 ),
             ),
         )
-        text = resp.text.strip()
+        text = _safe_response_text(resp)
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
         data = json.loads(text)
         classifications = data.get("classifications", [])
@@ -323,7 +342,7 @@ No explanation.
                 system_instruction="Return ONLY valid JSON.",
             ),
         )
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp.text.strip()).strip()
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", _safe_response_text(resp)).strip()
         data = json.loads(text)
         return data.get("is_niche", False)
     except Exception as e:
@@ -468,7 +487,7 @@ Rules:
                 ),
             ),
         )
-        text = resp.text.strip()
+        text = _safe_response_text(resp)
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
         data = json.loads(text)
         conditions  = data.get("conditions", [])
@@ -654,7 +673,7 @@ def _identify_company(molecule: str) -> str:
                 system_instruction="Return ONLY valid JSON. No markdown.",
             ),
         )
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp.text.strip()).strip()
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", _safe_response_text(resp)).strip()
         data = json.loads(text)
         company = data.get("company", "")
         print(f"  🏢 Auto-detected innovator: {company}")
@@ -769,7 +788,7 @@ def _research_single_source(q, molecule, company, client, gen_types):
                 ),
             ),
         )
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp.text.strip()).strip()
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", _safe_response_text(resp)).strip()
         entries = json.loads(text).get("entries", [])
         if not entries:
             print(f"     ⚠️  {source_type}: No entries")
