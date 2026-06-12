@@ -43,21 +43,83 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 def _safe_response_text(resp) -> str:
     """Safely extract text from a Gemini response.
-    With Google Search grounding, resp.text can be None — the content
-    lives in resp.candidates[0].content.parts instead."""
+
+    With Google Search grounding the simple `resp.text` property can be
+    None or raise an error.  Walk the full candidates → parts tree and
+    concatenate every text fragment we find.
+    """
+    # ── Fast path: .text works ────────────────────────────────────────────
     try:
         if resp.text is not None:
             return resp.text.strip()
     except Exception:
         pass
-    # Fallback: walk the candidates / parts structure
+
+    # ── Slow path: collect text from all parts ────────────────────────────
+    texts = []
     try:
-        for candidate in resp.candidates:
-            for part in candidate.content.parts:
-                if hasattr(part, "text") and part.text:
-                    return part.text.strip()
+        for candidate in (resp.candidates or []):
+            try:
+                parts = candidate.content.parts
+            except Exception:
+                continue
+            for part in (parts or []):
+                try:
+                    t = getattr(part, "text", None)
+                    if t:
+                        texts.append(t.strip())
+                except Exception:
+                    continue
     except Exception:
         pass
+
+    if texts:
+        return "\n".join(texts)
+
+    # ── Last resort: cast the whole response ──────────────────────────────
+    try:
+        s = str(resp)
+        if s and len(s) > 10:
+            return s.strip()
+    except Exception:
+        pass
+
+    return ""
+
+
+def _gemini_generate(client, gen_types, prompt, *, system_instruction="",
+                     use_search=True, model="gemini-2.5-flash"):
+    """Call Gemini with optional Google Search grounding.
+    If use_search is True and the response is empty, automatically retries
+    once without grounding so we always get text back."""
+    configs = []
+    if use_search:
+        configs.append(gen_types.GenerateContentConfig(
+            temperature=0,
+            tools=[gen_types.Tool(google_search=gen_types.GoogleSearch())],
+            system_instruction=system_instruction or "Return ONLY valid JSON.",
+        ))
+    configs.append(gen_types.GenerateContentConfig(
+        temperature=0,
+        system_instruction=system_instruction or "Return ONLY valid JSON.",
+    ))
+
+    for i, cfg in enumerate(configs):
+        try:
+            resp = client.models.generate_content(
+                model=model, contents=prompt, config=cfg,
+            )
+            text = _safe_response_text(resp)
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+            if text:
+                return text
+            if i == 0 and len(configs) > 1:
+                print("      ↻  Empty response with Search — retrying without grounding…")
+        except Exception as e:
+            if i == 0 and len(configs) > 1:
+                print(f"      ↻  Error with Search ({e}) — retrying without grounding…")
+            else:
+                raise
     return ""
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -204,21 +266,17 @@ Return ONLY valid JSON — no markdown fences, no explanation:
 
     print(f"🔹 Classifying {len(unique_indications)} unique indications for {molecule_name} (LLM + Search)…")
     try:
-        resp = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0,
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-                system_instruction=(
-                    "You are a pharmaceutical analyst. "
-                    "Search the web to find what this drug is approved for. "
-                    "Return ONLY valid JSON — no markdown, no explanation."
-                ),
+        text = _gemini_generate(
+            gemini_client, types, prompt,
+            system_instruction=(
+                "You are a pharmaceutical analyst. "
+                "Search the web to find what this drug is approved for. "
+                "Return ONLY valid JSON — no markdown, no explanation."
             ),
+            use_search=True,
         )
-        text = _safe_response_text(resp)
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+        if not text:
+            raise ValueError("Empty response from Gemini after retry")
         data = json.loads(text)
         classifications = data.get("classifications", [])
 
@@ -343,17 +401,13 @@ Return ONLY valid JSON:
 No explanation.
 """
     try:
-        resp = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0,
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-                system_instruction="Return ONLY valid JSON.",
-            ),
+        text = _gemini_generate(
+            gemini_client, types, prompt,
+            system_instruction="Return ONLY valid JSON.",
+            use_search=True,
         )
-        text = _safe_response_text(resp)
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+        if not text:
+            return False
         data = json.loads(text)
         return data.get("is_niche", False)
     except Exception as e:
@@ -431,20 +485,16 @@ Rules:
 
         def _call_gemini():
             try:
-                resp = gemini_client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0,
-                        tools=[types.Tool(google_search=types.GoogleSearch())],
-                        system_instruction=(
-                            "You are a clinical trial data assistant. "
-                            "Search for the trial on ClinicalTrials.gov or other registries "
-                            "to get the exact title. Return ONLY valid JSON."
-                        ),
+                text = _gemini_generate(
+                    gemini_client, types, prompt,
+                    system_instruction=(
+                        "You are a clinical trial data assistant. "
+                        "Search for the trial on ClinicalTrials.gov or other registries "
+                        "to get the exact title. Return ONLY valid JSON."
                     ),
+                    use_search=True,
                 )
-                result_holder["response"] = resp
+                result_holder["text"] = text
             except Exception as ex:
                 error_holder["error"] = ex
 
@@ -459,9 +509,9 @@ Rules:
         elif "error" in error_holder:
             raise error_holder["error"]
         else:
-            response    = result_holder["response"]
-            text        = _safe_response_text(response)
-            text        = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+            text = result_holder.get("text", "")
+            if not text:
+                raise ValueError("Empty response from Gemini")
             data        = json.loads(text)
             conditions  = data.get("conditions", [])
             trial_title = data.get("trial_title", "N/A")
