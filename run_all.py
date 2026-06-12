@@ -64,21 +64,72 @@ from openpyxl.utils import get_column_letter
 
 
 def _safe_response_text(resp) -> str:
-    """Safely extract text from a Gemini response.
-    With Google Search grounding, resp.text can be None — the content
-    lives in resp.candidates[0].content.parts instead."""
+    """Safely extract text from a Gemini response."""
     try:
         if resp.text is not None:
             return resp.text.strip()
     except Exception:
         pass
+    texts = []
     try:
-        for candidate in resp.candidates:
-            for part in candidate.content.parts:
-                if hasattr(part, "text") and part.text:
-                    return part.text.strip()
+        for candidate in (resp.candidates or []):
+            try:
+                parts = candidate.content.parts
+            except Exception:
+                continue
+            for part in (parts or []):
+                try:
+                    t = getattr(part, "text", None)
+                    if t:
+                        texts.append(t.strip())
+                except Exception:
+                    continue
     except Exception:
         pass
+    if texts:
+        return "\n".join(texts)
+    try:
+        s = str(resp)
+        if s and len(s) > 10:
+            return s.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _gemini_generate(client, gen_types, prompt, *, system_instruction="",
+                     use_search=True, model="gemini-2.5-flash"):
+    """Call Gemini with optional Google Search grounding.
+    If use_search is True and the response is empty, automatically retries
+    once without grounding."""
+    configs = []
+    if use_search:
+        configs.append(gen_types.GenerateContentConfig(
+            temperature=0,
+            tools=[gen_types.Tool(google_search=gen_types.GoogleSearch())],
+            system_instruction=system_instruction or "Return ONLY valid JSON.",
+        ))
+    configs.append(gen_types.GenerateContentConfig(
+        temperature=0,
+        system_instruction=system_instruction or "Return ONLY valid JSON.",
+    ))
+
+    for i, cfg in enumerate(configs):
+        try:
+            resp = client.models.generate_content(
+                model=model, contents=prompt, config=cfg,
+            )
+            text = _safe_response_text(resp)
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+            if text:
+                return text
+            if i == 0 and len(configs) > 1:
+                print("      ↻  Empty response with Search — retrying without grounding…")
+        except Exception as e:
+            if i == 0 and len(configs) > 1:
+                print(f"      ↻  Error with Search ({e}) — retrying without grounding…")
+            else:
+                raise
     return ""
 
 
@@ -199,21 +250,17 @@ Return ONLY valid JSON — no markdown fences, no explanation:
 
     print(f"  🔹 Classifying {len(unique_indications)} unique indications for {molecule_name} (LLM + Search)…")
     try:
-        resp = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=gen_types.GenerateContentConfig(
-                temperature=0,
-                tools=[gen_types.Tool(google_search=gen_types.GoogleSearch())],
-                system_instruction=(
-                    "You are a pharmaceutical analyst. "
-                    "Search the web to find what this drug is approved for. "
-                    "Return ONLY valid JSON — no markdown, no explanation."
-                ),
+        text = _gemini_generate(
+            gemini_client, gen_types, prompt,
+            system_instruction=(
+                "You are a pharmaceutical analyst. "
+                "Search the web to find what this drug is approved for. "
+                "Return ONLY valid JSON — no markdown, no explanation."
             ),
+            use_search=True,
         )
-        text = _safe_response_text(resp)
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+        if not text:
+            raise ValueError("Empty response from Gemini after retry")
         data = json.loads(text)
         classifications = data.get("classifications", [])
 
@@ -333,16 +380,13 @@ No explanation.
             gemini_client = _genai.Client(api_key=GEMINI_API_KEY)
             gen_types = _types
 
-        resp = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=gen_types.GenerateContentConfig(
-                temperature=0,
-                tools=[gen_types.Tool(google_search=gen_types.GoogleSearch())],
-                system_instruction="Return ONLY valid JSON.",
-            ),
+        text = _gemini_generate(
+            gemini_client, gen_types, prompt,
+            system_instruction="Return ONLY valid JSON.",
+            use_search=True,
         )
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", _safe_response_text(resp)).strip()
+        if not text:
+            return False
         data = json.loads(text)
         return data.get("is_niche", False)
     except Exception as e:
@@ -474,21 +518,17 @@ Rules:
 - No explanations outside the JSON
 """
     try:
-        resp = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=gen_types.GenerateContentConfig(
-                temperature=0,
-                tools=[gen_types.Tool(google_search=gen_types.GoogleSearch())],
-                system_instruction=(
-                    "You are a clinical trial data assistant. "
-                    "Search for the trial on ClinicalTrials.gov or other registries "
-                    "to get the exact title. Return ONLY valid JSON."
-                ),
+        text = _gemini_generate(
+            client, gen_types, prompt,
+            system_instruction=(
+                "You are a clinical trial data assistant. "
+                "Search for the trial on ClinicalTrials.gov or other registries "
+                "to get the exact title. Return ONLY valid JSON."
             ),
+            use_search=True,
         )
-        text = _safe_response_text(resp)
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+        if not text:
+            raise ValueError("Empty response from Gemini")
         data = json.loads(text)
         conditions  = data.get("conditions", [])
         trial_title = data.get("trial_title", "N/A")
@@ -661,19 +701,17 @@ def _identify_company(molecule: str) -> str:
     from google.genai import types as _types
     client = _genai.Client(api_key=GEMINI_API_KEY)
     try:
-        resp = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=(
+        text = _gemini_generate(
+            client, _types,
+            (
                 f"Who is the innovator pharmaceutical company that developed {molecule}? "
                 f"Return ONLY JSON: {{\"company\": \"<name>\", \"brand_names\": [\"name1\"]}}"
             ),
-            config=_types.GenerateContentConfig(
-                temperature=0,
-                tools=[_types.Tool(google_search=_types.GoogleSearch())],
-                system_instruction="Return ONLY valid JSON. No markdown.",
-            ),
+            system_instruction="Return ONLY valid JSON. No markdown.",
+            use_search=True,
         )
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", _safe_response_text(resp)).strip()
+        if not text:
+            return ""
         data = json.loads(text)
         company = data.get("company", "")
         print(f"  🏢 Auto-detected innovator: {company}")
@@ -775,20 +813,18 @@ def _research_single_source(q, molecule, company, client, gen_types):
     source_type = q["source_type"]
     rows = []
     try:
-        resp = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=q["prompt"],
-            config=gen_types.GenerateContentConfig(
-                temperature=0,
-                tools=[gen_types.Tool(google_search=gen_types.GoogleSearch())],
-                system_instruction=(
-                    "You are a pharmaceutical analyst researching what the "
-                    "innovator company publicly says about this drug. "
-                    "Search the web and SEC EDGAR. Return ONLY valid JSON."
-                ),
+        text = _gemini_generate(
+            client, gen_types, q["prompt"],
+            system_instruction=(
+                "You are a pharmaceutical analyst researching what the "
+                "innovator company publicly says about this drug. "
+                "Search the web and SEC EDGAR. Return ONLY valid JSON."
             ),
+            use_search=True,
         )
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", _safe_response_text(resp)).strip()
+        if not text:
+            print(f"     ⚠️  {source_type}: Empty response")
+            return (source_type, [])
         entries = json.loads(text).get("entries", [])
         if not entries:
             print(f"     ⚠️  {source_type}: No entries")
