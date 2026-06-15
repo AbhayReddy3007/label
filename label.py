@@ -536,7 +536,8 @@ def _enrich_single_trial(row, molecule_name, checkpoint, checkpoint_file, cp_loc
     with cp_lock:
         if trial_id in checkpoint:
             cp = checkpoint[trial_id]
-            return (trial_id, cp["conditions"], cp["trial_title"], row)
+            return (trial_id, cp["conditions"], cp["trial_title"],
+                    cp.get("phase", ""), row)
 
     prompt = f"""
 You are a clinical trial data assistant.
@@ -578,11 +579,13 @@ Return ONLY valid JSON:
     {{"indication": "<disease or condition>", "rationale": "<why — cite the trial record field>"}},
     {{"indication": "<disease or condition>", "rationale": "<why>"}}
   ],
-  "trial_title": "<EXACT official trial title as registered on the clinical trial registry>"
+  "trial_title": "<EXACT official trial title as registered on the clinical trial registry>",
+  "phase": "<Phase from the registry, e.g. Phase 1, Phase 2, Phase 3, Phase 4, Phase 2/3>"
 }}
 
 Rules:
 - trial_title must be the EXACT title from the registry, not a summary or guess
+- phase must match what the registry lists (e.g. Phase 3, Phase 2/Phase 3)
 - Include ALL indications the trial is evaluating
 - Always extract at least the primary indication
 - No explanations outside the JSON
@@ -623,6 +626,7 @@ Rules:
             data        = _extract_json(text)
             conditions  = data.get("conditions", [])
             trial_title = data.get("trial_title", "N/A")
+            extracted_phase = (data.get("phase") or "").strip()
 
             if isinstance(conditions, list):
                 normalized = []
@@ -650,15 +654,17 @@ Rules:
             print(f"   ✅ {trial_id}: {', '.join(c['indication'] for c in conditions) if conditions else 'no indications'}")
 
             with cp_lock:
-                checkpoint[trial_id] = {"conditions": conditions, "trial_title": trial_title}
+                checkpoint[trial_id] = {"conditions": conditions, "trial_title": trial_title,
+                                        "phase": extracted_phase}
                 save_checkpoint(checkpoint_file, checkpoint)
 
     except Exception as e:
         conditions  = []
         trial_title = str(e)
+        extracted_phase = ""
         print(f"   ❌ {trial_id}: {e}")
 
-    return (trial_id, conditions, trial_title, row)
+    return (trial_id, conditions, trial_title, extracted_phase, row)
 
 
 def enrich_with_gemini(rows, molecule_name):
@@ -688,7 +694,7 @@ def enrich_with_gemini(rows, molecule_name):
             except Exception as e:
                 row = rows[idx]
                 print(f"   ❌ Unexpected error for {row.get('trial_id')}: {e}")
-                results.append((row.get("trial_id"), [], str(e), row))
+                results.append((row.get("trial_id"), [], str(e), "", row))
 
     # Sort by original order
     trial_order = {row.get("trial_id"): i for i, row in enumerate(rows)}
@@ -696,7 +702,10 @@ def enrich_with_gemini(rows, molecule_name):
 
     # ── Unnest into flat rows (no classification yet) ────────────────────
     flat_rows = []
-    for trial_id, conditions, trial_title, row in results:
+    for trial_id, conditions, trial_title, extracted_phase, row in results:
+        # Use LLM-extracted phase as fallback when BigQuery phase is empty
+        phase = row.get("phase") or extracted_phase or ""
+
         if not conditions:
             flat_rows.append({
                 "molecule_name": row.get("molecule_name"),
@@ -705,7 +714,7 @@ def enrich_with_gemini(rows, molecule_name):
                 "rationale":     "",
                 "trial_title":   trial_title,
                 "trial_id":      trial_id,
-                "phase":         row.get("phase"),
+                "phase":         phase,
                 "source_url":    row.get("source_url"),
                 "data_source":   "Clinical Trials",
             })
@@ -730,7 +739,7 @@ def enrich_with_gemini(rows, molecule_name):
                 "rationale":     c.get("rationale", ""),
                 "trial_title":   trial_title,
                 "trial_id":      trial_id,
-                "phase":         row.get("phase"),
+                "phase":         phase,
                 "source_url":    row.get("source_url"),
                 "data_source":   "Clinical Trials",
             })
@@ -757,13 +766,19 @@ def enrich_with_gemini(rows, molecule_name):
                 and (row.get("therapy_area") or "").lower() != "metabolic"):
             row["indication_type"] = "Secondary"
 
-    # ── STEP 3: Compute Ep (row-wise) ────────────────────────────────────
+    # ── STEP 3: Compute Ep (row-wise, only for Primary/Secondary) ──────
     for row in flat_rows:
-        row["Ep"] = compute_ep(row.get("phase"))
+        ind_type = (row.get("indication_type") or "").lower()
+        if ind_type in ("primary", "secondary"):
+            row["Ep"] = compute_ep(row.get("phase"))
+        else:
+            row["Ep"] = ""
 
-    # ── STEP 4: Compute Et (drug-level) ──────────────────────────────────
+    # ── STEP 4: Compute Et (drug-level, only Primary/Secondary rows) ──
     print("🔹 Computing Et (drug-level expansion score)…")
-    et_value = compute_et(flat_rows, molecule_name)
+    scored_rows = [r for r in flat_rows
+                   if (r.get("indication_type") or "").lower() in ("primary", "secondary")]
+    et_value = compute_et(scored_rows, molecule_name)
     for row in flat_rows:
         row["Et"] = et_value
     print(f"   Et = {et_value}")
