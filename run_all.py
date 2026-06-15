@@ -579,7 +579,8 @@ def _enrich_single_trial(row, molecule_name, client, gen_types, checkpoint, cp_f
     with cp_lock:
         if trial_id in checkpoint:
             data = checkpoint[trial_id]
-            return (trial_id, data["conditions"], data["trial_title"], row)
+            return (trial_id, data["conditions"], data["trial_title"],
+                    data.get("phase", ""), row)
 
     prompt = f"""
 You are a clinical trial data assistant.
@@ -621,11 +622,13 @@ Return ONLY valid JSON:
     {{"indication": "<disease or condition>", "rationale": "<why — cite the trial record field>"}},
     {{"indication": "<disease or condition>", "rationale": "<why>"}}
   ],
-  "trial_title": "<EXACT official trial title as registered on the clinical trial registry>"
+  "trial_title": "<EXACT official trial title as registered on the clinical trial registry>",
+  "phase": "<Phase from the registry, e.g. Phase 1, Phase 2, Phase 3, Phase 4, Phase 2/3>"
 }}
 
 Rules:
 - trial_title must be the EXACT title from the registry, not a summary or guess
+- phase must match what the registry lists (e.g. Phase 3, Phase 2/Phase 3)
 - Include ALL indications the trial is evaluating
 - Always extract at least the primary indication
 - No explanations outside the JSON
@@ -645,6 +648,7 @@ Rules:
         data = _extract_json(text)
         conditions  = data.get("conditions", [])
         trial_title = data.get("trial_title", "N/A")
+        extracted_phase = (data.get("phase") or "").strip()
 
         if isinstance(conditions, list):
             normalized = []
@@ -670,15 +674,17 @@ Rules:
 
         print(f"     ✅ {trial_id}: {', '.join(c['indication'] for c in conditions)}")
         with cp_lock:
-            checkpoint[trial_id] = {"conditions": conditions, "trial_title": trial_title}
+            checkpoint[trial_id] = {"conditions": conditions, "trial_title": trial_title,
+                                    "phase": extracted_phase}
             save_checkpoint(cp_file, checkpoint)
 
     except Exception as e:
         conditions  = []
         trial_title = str(e)
+        extracted_phase = ""
         print(f"     ❌ {trial_id}: {e}")
 
-    return (trial_id, conditions, trial_title, row)
+    return (trial_id, conditions, trial_title, extracted_phase, row)
 
 
 def _gemini_enrich_trials(rows: list[dict], molecule_name: str,
@@ -711,14 +717,16 @@ def _gemini_enrich_trials(rows: list[dict], molecule_name: str,
             except Exception as e:
                 row = rows[idx]
                 print(f"     ❌ Unexpected: {row.get('trial_id')}: {e}")
-                results.append((row.get("trial_id"), [], str(e), row))
+                results.append((row.get("trial_id"), [], str(e), "", row))
 
     trial_order = {row.get("trial_id"): i for i, row in enumerate(rows)}
     results.sort(key=lambda r: trial_order.get(r[0], 0))
 
     # ── Unnest (no classification yet) ───────────────────────────────────
     flat = []
-    for trial_id, conditions, trial_title, row in results:
+    for trial_id, conditions, trial_title, extracted_phase, row in results:
+        phase = row.get("phase") or extracted_phase or ""
+
         if not conditions:
             flat.append({
                 "molecule_name": row.get("molecule_name"),
@@ -727,7 +735,7 @@ def _gemini_enrich_trials(rows: list[dict], molecule_name: str,
                 "rationale":     "",
                 "trial_title":   trial_title,
                 "trial_id":      trial_id,
-                "phase":         row.get("phase"),
+                "phase":         phase,
                 "source_url":    row.get("source_url"),
                 "data_source":   data_source_label,
             })
@@ -752,7 +760,7 @@ def _gemini_enrich_trials(rows: list[dict], molecule_name: str,
                 "rationale":     c.get("rationale", ""),
                 "trial_title":   trial_title,
                 "trial_id":      trial_id,
-                "phase":         row.get("phase"),
+                "phase":         phase,
                 "source_url":    row.get("source_url"),
                 "data_source":   data_source_label,
             })
@@ -777,13 +785,19 @@ def _gemini_enrich_trials(rows: list[dict], molecule_name: str,
                 and (row.get("therapy_area") or "").lower() != "metabolic"):
             row["indication_type"] = "Secondary"
 
-    # ── STEP 3: Ep (row-wise) ────────────────────────────────────────────
+    # ── STEP 3: Ep (row-wise, only for Primary/Secondary) ────────────
     for row in flat:
-        row["Ep"] = compute_ep(row.get("phase"))
+        ind_type = (row.get("indication_type") or "").lower()
+        if ind_type in ("primary", "secondary"):
+            row["Ep"] = compute_ep(row.get("phase"))
+        else:
+            row["Ep"] = ""
 
-    # ── STEP 4: Et (drug-level) ──────────────────────────────────────────
+    # ── STEP 4: Et (drug-level, only Primary/Secondary rows) ──────────
     print(f"  🔹 Computing Et…")
-    et_value = compute_et(flat, molecule_name, client, gen_types)
+    scored_rows = [r for r in flat
+                   if (r.get("indication_type") or "").lower() in ("primary", "secondary")]
+    et_value = compute_et(scored_rows, molecule_name, client, gen_types)
     for row in flat:
         row["Et"] = et_value
     print(f"     Et = {et_value}")
@@ -1024,14 +1038,20 @@ def _innovator_research(molecule: str, company: str) -> list[dict]:
                 and (row.get("therapy_area") or "").lower() != "metabolic"):
             row["indication_type"] = "Secondary"
 
-    # ── Ep (row-wise) ────────────────────────────────────────────────────
+    # ── Ep (row-wise, only for Primary/Secondary) ──────────────────────
     for row in unique:
-        row["Ep"] = compute_ep(row.get("phase"))
+        ind_type = (row.get("indication_type") or "").lower()
+        if ind_type in ("primary", "secondary"):
+            row["Ep"] = compute_ep(row.get("phase"))
+        else:
+            row["Ep"] = ""
 
-    # ── Et (drug-level) ──────────────────────────────────────────────────
-    if unique:
+    # ── Et (drug-level, only Primary/Secondary rows) ──────────────────
+    scored_rows = [r for r in unique
+                   if (r.get("indication_type") or "").lower() in ("primary", "secondary")]
+    if scored_rows:
         print(f"  🔹 Computing Et for innovator rows…")
-        et_value = compute_et(unique, molecule, client, _types)
+        et_value = compute_et(scored_rows, molecule, client, _types)
         for row in unique:
             row["Et"] = et_value
         print(f"     Et = {et_value}")
@@ -1168,6 +1188,18 @@ def write_molecule_excel(molecule: str, label_rows: list[dict],
     _write_standard_sheet(ws2, indication_rows, molecule, "Drug Indication Research")
 
     combined  = label_rows + indication_rows
+
+    # Et in "All Combined" = highest Et across all rows for the drug
+    et_values = [r.get("Et") for r in combined if r.get("Et")]
+    max_et = ""
+    if et_values:
+        try:
+            max_et = str(max(int(v) for v in et_values if str(v).isdigit()))
+        except ValueError:
+            max_et = et_values[0]
+    for row in combined:
+        row["Et"] = max_et
+
     ws3       = wb.create_sheet("All Combined")
     _write_standard_sheet(ws3, combined, molecule, "All Sources Combined")
 
