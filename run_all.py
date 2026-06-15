@@ -94,8 +94,13 @@ def _safe_response_text(resp) -> str:
 def _gemini_generate(client, gen_types, prompt, *, system_instruction="",
                      use_search=True, model="gemini-2.5-flash"):
     """Call Gemini with optional Google Search grounding.
-    If use_search is True and the response is empty, automatically retries
-    once without grounding."""
+    Retries on transient errors (503, 429, connection) with exponential backoff.
+    If use_search is True and the response is empty, retries without grounding."""
+    import time
+
+    MAX_RETRIES = 4
+    BASE_DELAY  = 5
+
     configs = []
     if use_search:
         configs.append(gen_types.GenerateContentConfig(
@@ -108,22 +113,46 @@ def _gemini_generate(client, gen_types, prompt, *, system_instruction="",
         system_instruction=system_instruction or "Return ONLY valid JSON.",
     ))
 
+    def _is_transient(exc):
+        err_str = str(exc).lower()
+        return any(k in err_str for k in ("503", "429", "unavailable", "overloaded",
+                                           "resource exhausted", "rate limit",
+                                           "deadline exceeded", "connection",
+                                           "timeout", "502", "500"))
+
     for i, cfg in enumerate(configs):
-        try:
-            resp = client.models.generate_content(
-                model=model, contents=prompt, config=cfg,
-            )
-            text = _safe_response_text(resp)
-            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
-            if text:
-                return text
+        last_err = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = client.models.generate_content(
+                    model=model, contents=prompt, config=cfg,
+                )
+                text = _safe_response_text(resp)
+                text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+                if text:
+                    return text
+                break
+            except Exception as e:
+                last_err = e
+                if _is_transient(e) and attempt < MAX_RETRIES - 1:
+                    delay = BASE_DELAY * (2 ** attempt)
+                    print(f"      ⏳ {e} — retrying in {delay}s ({attempt+1}/{MAX_RETRIES})…")
+                    time.sleep(delay)
+                elif i == 0 and len(configs) > 1:
+                    print(f"      ↻  Error with Search ({e}) — trying without grounding…")
+                    break
+                else:
+                    raise
+        else:
             if i == 0 and len(configs) > 1:
-                print("      ↻  Empty response with Search — retrying without grounding…")
-        except Exception as e:
-            if i == 0 and len(configs) > 1:
-                print(f"      ↻  Error with Search ({e}) — retrying without grounding…")
-            else:
-                raise
+                print(f"      ↻  Retries exhausted — trying without grounding…")
+                continue
+            if last_err:
+                raise last_err
+
+        if i == 0 and len(configs) > 1:
+            print("      ↻  Empty response with Search — retrying without grounding…")
+
     return ""
 
 
