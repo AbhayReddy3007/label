@@ -737,7 +737,7 @@ def _gemini_enrich_trials(rows: list[dict], molecule_name: str,
         molecule_name, unique_indications, client, gen_types
     )
     for row in flat:
-        cls = classification_map.get(r(ow["indication"] or "").lower(), {})
+        cls = classification_map.get((row["indication"] or "").lower(), {})
         row["indication_type"] = cls.get("indication_type", "")
         row["therapy_area"]    = cls.get("therapy_area", "")
         row["rationale"]       = cls.get("rationale", "")
@@ -984,7 +984,7 @@ def _innovator_research(molecule: str, company: str) -> list[dict]:
         molecule, unique_indications, client, _types
     )
     for row in unique:
-        cls = classification_map.get(r(ow["indication"] or "").lower(), {})
+        cls = classification_map.get((row["indication"] or "").lower(), {})
         row["indication_type"] = cls.get("indication_type", "")
         row["therapy_area"]    = cls.get("therapy_area", "")
         row["rationale"]       = cls.get("rationale", "")
