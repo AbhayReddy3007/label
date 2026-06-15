@@ -312,21 +312,68 @@ Return ONLY valid JSON — no markdown fences, no explanation:
                 }
                 print(f"     • {name}: {c.get('indication_type')} | {c.get('therapy_area')}")
 
+        # Retry missing indications individually
         for ind in unique_indications:
             if ind.lower() not in result:
-                print(f"     ⚠️  Missing classification for '{ind}' — defaulting")
-                result[ind.lower()] = {"indication_type": "Secondary", "therapy_area": "Other",
-                                       "rationale": "Classification not returned by LLM"}
+                print(f"     🔎 Missing '{ind}' — retrying individually…")
+                result[ind.lower()] = _classify_single_indication(
+                    molecule_name, ind, gemini_client, gen_types
+                )
 
         return result
 
     except Exception as e:
-        print(f"     ❌ Classification failed: {e}")
-        return {
-            ind.lower(): {"indication_type": "Secondary", "therapy_area": "Other",
-                          "rationale": f"Classification failed: {e}"}
-            for ind in unique_indications
+        print(f"     ❌ Bulk classification failed: {e}")
+        print(f"     🔎 Classifying each indication individually…")
+        result = {}
+        for ind in unique_indications:
+            result[ind.lower()] = _classify_single_indication(
+                molecule_name, ind, gemini_client, gen_types
+            )
+        return result
+
+
+def _classify_single_indication(molecule_name, indication, client, gen_types):
+    """Classify a single indication via LLM + Google Search."""
+    prompt = f"""
+You are a pharmaceutical analyst. Research the drug "{molecule_name}".
+
+Drug: {molecule_name}
+Indication: {indication}
+
+1. Is this indication "Primary" or "Secondary" for this drug?
+   - "Primary": one of the drug's main approved / originally intended indications
+   - "Secondary": a label expansion beyond the primary use
+
+2. What therapy area does this INDICATION belong to?
+   Choose from: Metabolic, Cardiovascular, Oncology, Neuroscience, Immunology,
+   Respiratory, Nephrology, Hepatology, Ophthalmology, Musculoskeletal,
+   Gastroenterology, Infectious Disease, Dermatology, Hematology,
+   Endocrinology, Rare Disease, or another appropriate area.
+
+3. Explain your reasoning.
+
+Return ONLY valid JSON:
+{{"indication_type": "Primary" or "Secondary", "therapy_area": "<area>", "rationale": "<why>"}}
+"""
+    try:
+        text = _gemini_generate(
+            client, gen_types, prompt,
+            system_instruction="Return ONLY valid JSON.",
+            use_search=True,
+        )
+        data = _extract_json(text)
+        cls = {
+            "indication_type": data.get("indication_type", "Secondary"),
+            "therapy_area":    data.get("therapy_area", "Other"),
+            "rationale":       data.get("rationale", ""),
         }
+        print(f"       • {indication}: {cls['indication_type']} | {cls['therapy_area']}")
+        return cls
+    except Exception as ex:
+        print(f"       ❌ Individual classification failed for '{indication}': {ex}")
+        return {"indication_type": "Secondary", "therapy_area": "Other",
+                "rationale": f"Classification failed: {ex}"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
