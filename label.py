@@ -427,21 +427,21 @@ def compute_et(enriched_rows, molecule_name):
     1 therapy area, primary indication(s) only          → 1
     """
     drug_rows = [r for r in enriched_rows
-                 if r.get("molecule_name", "").lower() == molecule_name.lower()]
+                 if (r.get("molecule_name") or "").lower() == molecule_name.lower()]
     if not drug_rows:
         return ""
 
     therapy_areas = set(
         r["therapy_area"] for r in drug_rows
-        if r.get("therapy_area") and r["therapy_area"].lower() not in ("other", "")
+        if r.get("therapy_area") and (r["therapy_area"] or "").lower() not in ("other", "")
     )
     secondary_indications = list(set(
         r["indication"] for r in drug_rows
-        if r.get("indication_type", "").lower() == "secondary"
+        if (r.get("indication_type") or "").lower() == "secondary"
     ))
     primary_indications = list(set(
         r["indication"] for r in drug_rows
-        if r.get("indication_type", "").lower() == "primary"
+        if (r.get("indication_type") or "").lower() == "primary"
     ))
 
     if len(therapy_areas) > 1:
@@ -610,7 +610,7 @@ Rules:
             # Deduplicate
             seen, deduped = set(), []
             for c in conditions:
-                key = c["indication"].lower()
+                key = (c["indication"] or "").lower()
                 if key and key not in seen:
                     seen.add(key)
                     deduped.append(c)
@@ -714,7 +714,7 @@ def enrich_with_gemini(rows, molecule_name):
 
     # Apply classification to every row
     for row in flat_rows:
-        ind_key = row["indication"].lower()
+        ind_key = (row["indication"] or "").lower()
         cls = classification_map.get(ind_key, {})
         row["indication_type"] = cls.get("indication_type", "")
         row["therapy_area"]    = cls.get("therapy_area", "")
@@ -722,8 +722,8 @@ def enrich_with_gemini(rows, molecule_name):
 
     # Override: Primary + non-Metabolic therapy area → Secondary
     for row in flat_rows:
-        if (row.get("indication_type", "").lower() == "primary"
-                and row.get("therapy_area", "").lower() != "metabolic"):
+        if ((row.get("indication_type") or "").lower() == "primary"
+                and (row.get("therapy_area") or "").lower() != "metabolic"):
             row["indication_type"] = "Secondary"
 
     # ── STEP 3: Compute Ep (row-wise) ────────────────────────────────────
