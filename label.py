@@ -711,6 +711,64 @@ def _thin_border():
                   right=Side(style="thin", color="DDDDDD"))
 
 
+def _write_summary_sheet(wb, rows, title_label="Summary"):
+    """Add a 'Summary' sheet: Drug Name | No. of Indications | No. of Therapy Areas."""
+    ws = wb.create_sheet("Summary")
+    thin  = _thin_border()
+    hfill = PatternFill("solid", start_color="1A1A2E")
+    alt   = PatternFill("solid", start_color="F4F7FB")
+
+    # Aggregate per drug
+    from collections import defaultdict
+    drug_data = defaultdict(lambda: {"indications": set(), "therapy_areas": set()})
+    for r in rows:
+        name = r.get("molecule_name", "")
+        ind  = r.get("indication", "")
+        ta   = r.get("therapy_area", "")
+        if not name or ind == "No indication found":
+            continue
+        drug_data[name]["indications"].add(ind)
+        if ta and ta.lower() not in ("other", ""):
+            drug_data[name]["therapy_areas"].add(ta)
+
+    summary_headers = ["Drug Name", "No. of Indications", "No. of Therapy Areas"]
+    summary_widths  = [28, 20, 22]
+
+    # Title row
+    ws.merge_cells("A1:C1")
+    c           = ws["A1"]
+    c.value     = f"Summary  —  {title_label}"
+    c.font      = Font(name="Arial", bold=True, size=14, color="1A1A2E")
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[1].height = 32
+
+    # Header row
+    for col, h in enumerate(summary_headers, 1):
+        c           = ws.cell(row=2, column=col, value=h)
+        c.font      = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+        c.fill      = hfill
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border    = thin
+    ws.row_dimensions[2].height = 22
+
+    # Data rows
+    for idx, (drug, info) in enumerate(sorted(drug_data.items()), start=3):
+        fill = alt if idx % 2 == 1 else None
+        vals = [drug, len(info["indications"]), len(info["therapy_areas"])]
+        for col, val in enumerate(vals, 1):
+            c           = ws.cell(row=idx, column=col, value=val)
+            c.font      = Font(name="Arial", size=10)
+            c.alignment = Alignment(horizontal="center" if col > 1 else "left",
+                                    vertical="center")
+            c.border    = thin
+            if fill:
+                c.fill = fill
+        ws.row_dimensions[idx].height = 20
+
+    for i, w in enumerate(summary_widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+
 def write_excel(rows, molecule_name, output_dir=None):
     print("🔹 Writing Excel...")
     wb = openpyxl.Workbook()
@@ -755,6 +813,9 @@ def write_excel(rows, molecule_name, output_dir=None):
     ws.freeze_panes = "A3"
     for i, w in enumerate(COL_WIDTHS, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
+
+    # ── Summary sheet ────────────────────────────────────────────────────
+    _write_summary_sheet(wb, rows, molecule_name)
 
     file_name = f"{molecule_name.lower().replace(' ', '_')}_clinical_efficacy.xlsx"
     if output_dir:
