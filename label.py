@@ -8,6 +8,8 @@ Output: one indication per row with Ep and Et scores.
 
 Usage:
     python label.py semaglutide
+    python label.py semaglutide tirzepatide liraglutide
+    python label.py "semaglutide, tirzepatide, liraglutide"
 """
 
 import sys
@@ -914,33 +916,162 @@ def write_excel(rows, molecule_name, output_dir=None):
     return file_name
 
 
+def write_combined_excel(all_rows, molecule_names, output_dir=None):
+    """Write a single workbook containing every molecule's rows together,
+    plus the aggregated Summary sheet (one row per drug)."""
+    print("🔹 Writing combined Excel...")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Clinical Efficacy"
+
+    thin     = _thin_border()
+    hfill    = PatternFill("solid", start_color="1A1A2E")
+    alt_fill = PatternFill("solid", start_color="F4F7FB")
+    ncols    = len(HEADERS)
+
+    title = f"Clinical Efficacy  —  {', '.join(m.title() for m in molecule_names)}"
+    ws.merge_cells(f"A1:{get_column_letter(ncols)}1")
+    c = ws["A1"]
+    c.value     = title
+    c.font      = Font(name="Arial", bold=True, size=14, color="1A1A2E")
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[1].height = 32
+
+    for col, h in enumerate(HEADERS, 1):
+        c           = ws.cell(row=2, column=col, value=h)
+        c.font      = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+        c.fill      = hfill
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border    = thin
+    ws.row_dimensions[2].height = 22
+
+    for idx, row in enumerate(all_rows, start=3):
+        fill = alt_fill if idx % 2 == 1 else None
+        for col, key in enumerate(HEADERS, 1):
+            c           = ws.cell(row=idx, column=col, value=row.get(key, ""))
+            c.font      = Font(name="Arial", size=9)
+            c.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+            c.border    = thin
+            if fill:
+                c.fill = fill
+        ws.row_dimensions[idx].height = 18
+
+    ws.auto_filter.ref = f"A2:{get_column_letter(ncols)}{2 + len(all_rows)}"
+    ws.freeze_panes = "A3"
+    for i, w in enumerate(COL_WIDTHS, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    _write_summary_sheet(wb, all_rows, ", ".join(m.title() for m in molecule_names))
+
+    file_name = "combined_clinical_efficacy.xlsx"
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        file_name = os.path.join(output_dir, file_name)
+    wb.save(file_name)
+    print(f"✅ Combined Excel saved → {file_name}\n")
+    return file_name
+
+
+def _parse_molecule_names(raw_args):
+    """Accept molecule names given either as multiple CLI args
+    (space-separated) or as a single comma-separated string, and
+    normalize into a clean, de-duplicated, order-preserving list."""
+    pieces = []
+    for arg in raw_args:
+        pieces.extend(arg.split(","))
+
+    seen = set()
+    molecules = []
+    for p in pieces:
+        name = p.strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        molecules.append(name)
+    return molecules
+
+
+def run_for_molecule(molecule, output_dir):
+    """Run the full fetch → enrich → score pipeline for one molecule.
+    Returns the enriched rows list (or [] on failure)."""
+    print(f"\n{'='*70}")
+    print(f"  MOLECULE: {molecule}")
+    print(f"{'='*70}\n")
+
+    print("[1/3] Fetching data...")
+    rows = fetch_rows(molecule)
+    if not rows:
+        print(f"❌ No data found for {molecule}")
+        return []
+
+    print("[2/3] Enriching data...")
+    enriched = enrich_with_gemini(rows, molecule)
+
+    print("[3/3] Generating Excel...")
+    write_excel(enriched, molecule, output_dir)
+
+    return enriched
+
+
 def main():
     from datetime import datetime
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("molecule_name")
+    parser.add_argument(
+        "molecule_names",
+        nargs="+",
+        help='One or more molecule names, e.g. "semaglutide tirzepatide" '
+             'or "semaglutide, tirzepatide, liraglutide"',
+    )
+    parser.add_argument(
+        "--combined", action="store_true",
+        help="Also write a single combined workbook with all molecules together",
+    )
     args = parser.parse_args([a for a in sys.argv[1:] if a != "--"])
-    molecule = args.molecule_name
+    molecules = _parse_molecule_names(args.molecule_names)
 
-    # Create timestamped output folder
+    if not molecules:
+        print("❌ No valid molecule names provided")
+        return
+
+    # Shared timestamped output folder for this batch
     timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = f"output_{timestamp}"
     os.makedirs(output_dir, exist_ok=True)
 
-    print("\n🚀 Pipeline Started\n")
-    print(f"📂 Output folder: {output_dir}\n")
-    print("[1/3] Fetching data...")
-    rows = fetch_rows(molecule)
-    if not rows:
-        print("❌ No data found")
-        return
-    print("[2/3] Enriching data...")
-    enriched = enrich_with_gemini(rows, molecule)
-    print("[3/3] Generating Excel...")
-    output = write_excel(enriched, molecule, output_dir)
-    print("🎉 DONE")
-    print(f"📄 File: {output}")
-    print(f"📊 Rows processed: {len(enriched)}")
+    print("\n🚀 Pipeline Started")
+    print(f"📂 Output folder: {output_dir}")
+    print(f"💊 Molecules ({len(molecules)}): {', '.join(molecules)}\n")
+
+    all_rows = []
+    succeeded, failed = [], []
+
+    for molecule in molecules:
+        try:
+            enriched = run_for_molecule(molecule, output_dir)
+            if enriched:
+                all_rows.extend(enriched)
+                succeeded.append(molecule)
+            else:
+                failed.append(molecule)
+        except Exception as e:
+            print(f"❌ Pipeline failed for {molecule}: {e}")
+            failed.append(molecule)
+
+    if args.combined and all_rows:
+        write_combined_excel(all_rows, succeeded, output_dir)
+
+    print("\n" + "=" * 70)
+    print("🎉 BATCH DONE")
+    print("=" * 70)
+    print(f"📂 Output folder : {output_dir}")
+    print(f"✅ Succeeded     : {len(succeeded)} ({', '.join(succeeded) if succeeded else '-'})")
+    print(f"❌ Failed        : {len(failed)} ({', '.join(failed) if failed else '-'})")
+    print(f"📊 Total rows    : {len(all_rows)}")
+
 
 if __name__ == "__main__":
     main()
