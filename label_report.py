@@ -1,987 +1,498 @@
-#!/usr/bin/env python3
-"""
-Label Expansion Report Generator (Business-Facing)
-====================================================
-Reads the Excel files produced by run_all.py / label.py and generates
-a concise, insight-driven PDF report (max 2 pages) for senior business
-stakeholders.
-
-The report focuses on indication breadth, label expansion potential,
-therapy area coverage, and strategic implications — NOT scores.
-
-Gemini 2.5 Flash generates the analytical narrative. Falls back to a
-structured summary if the API is unavailable.
-
-Usage:
-    python label_report.py --molecule semaglutide
-    python label_report.py --molecule semaglutide tirzepatide
-    python label_report.py --output-dir output --molecule dupilumab
-"""
-
-import argparse
-import glob
-import json
-import os
-import re
-import sys
-from collections import defaultdict
-from datetime import datetime
-from pathlib import Path
-
-from dotenv import load_dotenv
-
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
-from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-    HRFlowable, KeepTogether
-)
-
-import openpyxl
-
-load_dotenv()
-
-DEFAULT_OUTPUT_DIR = "output"
-
-GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_API_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent"
-)
-
-
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-
-def normalize(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(s).lower())
-
-
-def find_excel_file(output_dir: str, molecule: str) -> str | None:
-    """Locate the Excel file produced by run_all.py or label.py for a molecule."""
-    safe = re.sub(r"[^a-zA-Z0-9]", "_", molecule.strip().lower())
-
-    # Patterns: <molecule>_research.xlsx (run_all.py) or <molecule>_clinical_efficacy.xlsx (label.py)
-    patterns = [
-        str(Path(output_dir) / f"{safe}_research.xlsx"),
-        str(Path(output_dir) / f"{safe}_clinical_efficacy.xlsx"),
-        str(Path(output_dir) / f"*{safe}*.xlsx"),
-    ]
-    for pattern in patterns:
-        matches = glob.glob(pattern)
-        if matches:
-            matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            return matches[0]
-
-    # Broad search
-    all_xlsx = glob.glob(str(Path(output_dir) / "*.xlsx"))
-    for f in all_xlsx:
-        if normalize(molecule) in normalize(Path(f).stem):
-            return f
-    return None
-
-
-def read_excel_data(file_path: str) -> list[dict]:
-    """Read rows from the 'All Combined' or 'Clinical Efficacy' sheet."""
-    wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
-
-    # Prefer 'All Combined' sheet, fall back to first sheet
-    for sheet_name in ["All Combined", "Clinical Efficacy", "All Molecules"]:
-        if sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            break
-    else:
-        ws = wb.active
-
-    rows = []
-    headers = None
-    for row_cells in ws.iter_rows(values_only=True):
-        vals = list(row_cells)
-        # Skip title rows (merged cells with a single value)
-        non_empty = [v for v in vals if v is not None and str(v).strip()]
-        if len(non_empty) <= 2:
-            continue
-
-        # Detect header row
-        if headers is None:
-            lower_vals = [str(v).strip().lower() for v in vals if v]
-            if "indication" in lower_vals or "molecule_name" in lower_vals:
-                headers = [str(v).strip() if v else f"col_{i}" for i, v in enumerate(vals)]
-                continue
-            continue
-
-        row_dict = {}
-        for i, h in enumerate(headers):
-            row_dict[h] = vals[i] if i < len(vals) else ""
-        rows.append(row_dict)
-
-    wb.close()
-    return rows
-
-
-def extract_label_data(rows: list[dict], molecule: str) -> dict:
-    """Extract structured data from the Excel rows for report generation."""
-    # Filter rows for this molecule
-    mol_rows = [
-        r for r in rows
-        if normalize(r.get("molecule_name", "")) == normalize(molecule)
-        or normalize(molecule) in normalize(r.get("molecule_name", ""))
-    ]
-    if not mol_rows:
-        mol_rows = rows  # Use all rows if molecule filter returns nothing
-
-    # Gather indications (exclude "No indication found")
-    all_indications = set()
-    primary_indications = set()
-    secondary_indications = set()
-    secondary_indication_rationales: dict[str, dict] = {}  # ind → {rationale, therapy_area, phase}
-    therapy_areas = set()
-    data_sources = set()
-    trials = set()
-    phases = defaultdict(int)
-    indication_details = []  # For passing to Gemini
-
-    company_name = ""
-    has_regulatory_label = False
-
-    for r in mol_rows:
-        ind = (r.get("indication") or "").strip()
-        if not ind or ind.lower() in ("no indication found", "n/a", "none", "error"):
-            continue
-
-        ind_type = (r.get("indication_type") or "").strip().lower()
-        if ind_type not in ("primary", "secondary"):
-            continue
-
-        all_indications.add(ind)
-
-        if ind_type == "primary":
-            primary_indications.add(ind)
-        elif ind_type == "secondary":
-            secondary_indications.add(ind)
-            # Keep the longest / most informative rationale per indication
-            rationale = (r.get("rationale") or "").strip()
-            existing = secondary_indication_rationales.get(ind)
-            if not existing or len(rationale) > len(existing.get("rationale", "")):
-                secondary_indication_rationales[ind] = {
-                    "rationale": rationale,
-                    "therapy_area": (r.get("therapy_area") or "").strip(),
-                    "phase": (r.get("phase") or "").strip(),
-                }
-
-        ta = (r.get("therapy_area") or "").strip()
-        if ta and ta.lower() not in ("other", ""):
-            therapy_areas.add(ta)
-
-        ds = (r.get("data_source") or "").strip()
-        if ds:
-            data_sources.add(ds)
-            if "regulatory" in ds.lower() or "label" in ds.lower():
-                has_regulatory_label = True
-
-        tid = (r.get("trial_id") or "").strip()
-        if tid:
-            trials.add(tid)
-
-        phase = (r.get("phase") or "").strip()
-        if phase:
-            phases[phase] += 1
-
-        if not company_name:
-            company_name = (r.get("company_name") or "").strip()
-
-        indication_details.append({
-            "indication": ind,
-            "type": r.get("indication_type", ""),
-            "therapy_area": ta,
-            "rationale": (r.get("rationale") or "")[:200],
-            "trial_title": (r.get("trial_title") or "")[:100],
-            "trial_id": tid,
-            "phase": phase,
-            "data_source": ds,
-        })
-
-    # Deduplicate indication_details by (indication, data_source)
-    seen = set()
-    unique_details = []
-    for d in indication_details:
-        key = (d["indication"].lower(), d["data_source"])
-        if key not in seen:
-            seen.add(key)
-            unique_details.append(d)
-
-    return {
-        "molecule_name": mol_rows[0].get("molecule_name", molecule) if mol_rows else molecule,
-        "company_name": company_name,
-        "total_indications": len(all_indications),
-        "primary_indications": sorted(primary_indications),
-        "secondary_indications": sorted(secondary_indications),
-        "secondary_indication_rationales": secondary_indication_rationales,
-        "therapy_areas": sorted(therapy_areas),
-        "data_sources": sorted(data_sources),
-        "total_trials": len(trials),
-        "phase_distribution": dict(phases),
-        "has_regulatory_label": has_regulatory_label,
-        "total_rows": len(mol_rows),
-        "indication_details": unique_details[:40],  # Cap for prompt length
-    }
-
-
-def safe_text(val) -> str:
-    if val is None:
-        return "N/A"
-    s = str(val).strip()
-    return s if s else "N/A"
-
-
-def escape_html(s: str) -> str:
-    if s is None:
-        return ""
-    s = str(s)
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def lookup_innovator(molecule_name: str, sponsor_hint: str = "") -> str | None:
-    import urllib.request
-    import urllib.error
-
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        return None
-
-    prompt = (
-        f"Identify the original innovator company that first developed or "
-        f"discovered the pharmaceutical molecule \"{molecule_name}\". "
-        f"The company on record is \"{sponsor_hint or 'Unknown'}\". "
-        f"Return ONLY the company name on a single line — no explanation, "
-        f"no punctuation beyond what is in the name itself. "
-        f"If you are unsure, return the company name as-is."
-    )
-
-    payload = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 64},
-    }).encode("utf-8")
-
-    url = f"{GEMINI_API_URL}?key={api_key}"
-    req = urllib.request.Request(
-        url, data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        print(f"  [AI]  Looking up innovator for {molecule_name}...")
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-        text = (
-            result.get("candidates", [{}])[0]
-                  .get("content", {})
-                  .get("parts", [{}])[0]
-                  .get("text", "")
-        ).strip()
-        if text:
-            print(f"  [AI]  Innovator resolved: {text}")
-            return text
-        return None
-    except Exception as e:
-        print(f"  [WARN] Innovator lookup failed ({e}), using company as fallback.",
-              file=sys.stderr)
-        return None
-
-
-# ---------------------------------------------------------------------
-# Gemini narrative — business-facing analytical report
-# ---------------------------------------------------------------------
-
-def build_gemini_prompt(molecule_name: str, data: dict) -> str:
-    """
-    Build a prompt that instructs Gemini to produce the business-facing
-    analytical report for the Label Expansion dimension.
-    """
-    # Build indication summary
-    indication_lines = []
-    for d in data["indication_details"][:30]:
-        indication_lines.append(
-            f"  {d['indication']} | Type: {d['type']} | "
-            f"Therapy Area: {d['therapy_area']} | Phase: {d['phase']} | "
-            f"Source: {d['data_source']}"
-        )
-
-    primary_list = ", ".join(data["primary_indications"][:10]) or "None identified"
-    secondary_list = ", ".join(data["secondary_indications"][:15]) or "None identified"
-    ta_list = ", ".join(data["therapy_areas"]) or "None identified"
-    sources_list = ", ".join(data["data_sources"]) or "N/A"
-
-    # Build secondary indication rationale lines
-    rationales_map = data.get("secondary_indication_rationales", {})
-    secondary_rationale_lines = []
-    for ind in data["secondary_indications"][:15]:
-        info = rationales_map.get(ind, {})
-        rationale = info.get("rationale", "No rationale available")
-        ta = info.get("therapy_area", "")
-        phase = info.get("phase", "")
-        line = f"  {ind}"
-        if ta:
-            line += f" | Therapy Area: {ta}"
-        if phase:
-            line += f" | {phase}"
-        line += f"\n    Reason it is a secondary indication: {rationale}"
-        secondary_rationale_lines.append(line)
-
-    prompt = f"""You are a senior business analyst preparing a detailed analytical report 
-on the label expansion dimension of the pharmaceutical molecule "{molecule_name}" 
-for senior business decision-makers.
-
-This dimension evaluates the breadth and depth of the drug's indication landscape — 
-how many distinct indications it is approved for or being studied in, whether it has 
-expanded beyond its primary use, how many therapy areas it spans, and what this means 
-for the drug's commercial and strategic potential.
-
-YOUR OUTPUT MUST FOLLOW THIS EXACT STRUCTURE (use these exact headings):
-
-## HEADLINE
-Write ONE impactful sentence summarizing the overall business implication of the 
-label expansion landscape for this molecule. This should be the single most important 
-takeaway a decision-maker needs.
-
-## INDICATION LANDSCAPE
-Write 3-5 sentences providing the quantitative context a decision-maker needs. 
-Cover: how many distinct indications exist (primary vs. secondary/expansion), 
-how many therapy areas the drug spans, what the primary indication(s) are and 
-what expansion indications are being pursued, what data sources corroborate the 
-findings (clinical trials, regulatory labels, investor materials, SEC filings), 
-and the phase maturity of indication-level evidence. Cite specific numbers from 
-the data. This section sets the stage — it should tell the reader the size and 
-shape of the indication portfolio before diving into insights.
-
-## KEY INSIGHTS
-
-Provide 4-6 key insights. For EACH insight, write EXACTLY two lines using this format:
-Line 1: "Insight: " followed by a short, specific finding (ONE sentence, max 20 words).
-         This is the bold headline of the insight.
-Line 2: "Why it matters: " followed by the business implication (2-3 sentences, 
-         ~40-60 words). This is the explanatory body text.
-
-IMPORTANT: You MUST use exactly the labels "Insight: " and "Why it matters: " — 
-these labels are required for formatting.
-
-Example format:
-Insight: Drug spans 4 therapy areas beyond its original metabolic indication.
-Why it matters: Multi-therapy-area reach transforms the commercial model from a single-franchise asset to a platform molecule. Each new therapy area unlocks distinct prescriber networks, payer segments, and revenue pools — compounding lifecycle value.
-
-Insight: 3 secondary indications are already in Phase 3, signaling near-term label expansion.
-Why it matters: Phase 3 secondary indications with active enrollment represent 12-24 month catalysts for label expansion. Successful readouts would broaden the addressable market and strengthen payer negotiation leverage with real-world evidence of multi-indication utility.
-
-Be specific. Reference indication counts, therapy area breadth, primary vs. secondary 
-classification, geographic reach, or data source corroboration. Do NOT write generic 
-statements like "the label is expanding" without concrete data.
-
-Prioritize insights that address:
-1. Breadth of indication portfolio and what it enables (platform potential, lifecycle value)
-2. Therapy area diversification and cross-specialty commercial opportunity
-3. Regulatory label status — approved indications vs. investigational expansions
-4. Quality and variety of evidence sources (clinical trials, regulatory filings, investor disclosures)
-5. Label expansion gaps that create risk or delay
-6. Pipeline maturity of secondary indications (how close to approval)
-
-## EXPANSION INDICATIONS
-For EACH secondary (expansion) indication listed in the data below, write EXACTLY 
-two lines using this format:
-Line 1: "Indication: " followed by the indication name and its therapy area in parentheses.
-Line 2: "Rationale: " followed by 1-2 sentences explaining WHY this is classified as 
-         a secondary/expansion indication — i.e., what makes it distinct from the primary 
-         label, what evidence supports it, and its current development status. Use the 
-         rationale data provided but rewrite it in clear business language.
-
-IMPORTANT: You MUST use exactly the labels "Indication: " and "Rationale: " — 
-these labels are required for formatting. Cover ALL secondary indications listed.
-
-## EVIDENCE GAPS & RISKS
-Write 3-5 bullet points (each starting with "- ") identifying the most material 
-gaps in the label expansion profile and the business risk each creates. Focus ONLY 
-on indication and expansion gaps — for example, missing indications in large 
-addressable markets, limited expansion beyond primary therapy area, over-reliance 
-on a single indication for revenue, absence of real-world evidence for newer 
-indications, or lack of confirmatory data for pipeline expansions.
-CRITICAL: Do NOT mention peer-reviewed journals, publications, published literature, 
-academic publishing, or the need for more published studies. These are NOT relevant 
-gaps for this report. Every gap must be about missing DATA or missing INDICATIONS.
-
-## BOTTOM LINE
-Write 3-4 sentences stating what a decision-maker should infer from this dimension. 
-Be direct and actionable — state whether the label expansion profile supports 
-investment, partnership, or market entry decisions, and flag any conditions or 
-watchpoints. Focus on the strategic value of the indication breadth.
-
-STRICT RULES:
-- Total length: 700-1000 words (the report should comfortably fill ~2 pages)
-- NO technical jargon (no "Ep", "Et", "scoring", "model", "pipeline page API", 
-  "BigQuery", "ClinicalTrials.gov API", "Gemini", "LLM")
-- Do NOT mention scores of any kind — no Ep, Et, numerical scores, or scoring methodology
-- Do NOT mention peer-reviewed journals, publications, or academic publishing anywhere
-- You MUST use "Insight: " and "Why it matters: " labels exactly in KEY INSIGHTS
-- Every statement must add insight or implication — no restating obvious facts
-- Use clear, natural business language that a non-scientific executive can follow
-- Do not use markdown bold (**text**) — use plain text only
-- Reference specific numbers, indication counts, and therapy areas wherever possible
-- Keep paragraphs short (2-4 sentences max)
-
-DATA FOR YOUR ANALYSIS:
-======================
-
-Molecule: {molecule_name}
-Company: {data['company_name'] or 'Unknown'}
-
-Total Unique Indications: {data['total_indications']}
-Primary Indications: {primary_list}
-Secondary (Expansion) Indications: {secondary_list}
-Number of Therapy Areas: {len(data['therapy_areas'])}
-Therapy Areas: {ta_list}
-Total Trials / Sources: {data['total_trials']}
-Data Sources: {sources_list}
-Has Regulatory Label Data: {'Yes' if data['has_regulatory_label'] else 'No'}
-
-Phase Distribution: {json.dumps(data['phase_distribution'])}
-
-Secondary Indication Details (with rationale for each):
-{chr(10).join(secondary_rationale_lines) if secondary_rationale_lines else 'No secondary indications identified'}
-
-Indication Details (first 30):
-{chr(10).join(indication_lines) if indication_lines else 'No indication details available'}
-
-Now write the report. Remember: business language, specific numbers, no jargon, 
-no scores, 700-1000 words. 
-CRITICAL: In KEY INSIGHTS, every insight headline MUST start with "Insight: " 
-and every body line MUST start with "Why it matters: "."""
-
-    return prompt
-
-
-def generate_gemini_narrative(molecule_name: str, data: dict) -> str | None:
-    import urllib.request
-    import urllib.error
-
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        print("  [WARN] GEMINI_API_KEY not set — skipping AI narrative.")
-        return None
-
-    prompt = build_gemini_prompt(molecule_name, data)
-
-    payload = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.25,
-            "maxOutputTokens": 16384,
-        },
-    }).encode("utf-8")
-
-    url = f"{GEMINI_API_URL}?key={api_key}"
-    req = urllib.request.Request(
-        url, data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        print(f"  [AI]  Requesting business narrative for {molecule_name}...")
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-        text = (
-            result.get("candidates", [{}])[0]
-                  .get("content", {})
-                  .get("parts", [{}])[0]
-                  .get("text", "")
-        )
-        if text.strip():
-            print(f"  [AI]  Narrative received ({len(text)} chars).")
-            return text.strip()
-        else:
-            print("  [WARN] Gemini returned empty response.", file=sys.stderr)
-            return None
-    except Exception as e:
-        print(f"  [ERR] Gemini API call failed: {e}", file=sys.stderr)
-        return None
-
-
-# ---------------------------------------------------------------------
-# PDF building — compact, insight-driven, max ~2 pages
-# ---------------------------------------------------------------------
-
-NAVY = colors.HexColor("#1F3864")
-BLUE = colors.HexColor("#2E75B6")
-LIGHT_BLUE = colors.HexColor("#D9E1F2")
-GREEN = colors.HexColor("#2E7D32")
-RED = colors.HexColor("#C62828")
-AMBER = colors.HexColor("#B8860B")
-GREY = colors.HexColor("#666666")
-DARK_TEXT = colors.HexColor("#1A1A2E")
-
-
-def build_styles():
-    styles = getSampleStyleSheet()
-
-    styles.add(ParagraphStyle(
-        name="ReportTitle", fontSize=18, leading=22, textColor=NAVY,
-        fontName="Helvetica-Bold", spaceAfter=2, alignment=TA_LEFT,
-    ))
-    styles.add(ParagraphStyle(
-        name="ReportSubtitle", fontSize=9.5, leading=12, textColor=GREY,
-        fontName="Helvetica", spaceAfter=1,
-    ))
-    styles.add(ParagraphStyle(
-        name="SectionHeader", fontSize=11.5, leading=14, textColor=colors.white,
-        fontName="Helvetica-Bold", spaceBefore=10, spaceAfter=0,
-        backColor=NAVY, leftIndent=6, borderPadding=(5, 5, 5, 5),
-    ))
-    styles.add(ParagraphStyle(
-        name="Headline", fontSize=11, leading=14, textColor=NAVY,
-        fontName="Helvetica-Bold", spaceAfter=6, spaceBefore=6,
-        alignment=TA_LEFT,
-    ))
-    styles.add(ParagraphStyle(
-        name="InsightHeadline",
-        fontSize=10.5,
-        leading=14,
-        textColor=BLUE,
-        fontName="Helvetica-Bold",
-        spaceBefore=10,
-        spaceAfter=2,
-        leftIndent=0,
-        alignment=TA_LEFT,
-    ))
-    styles.add(ParagraphStyle(
-        name="InsightBody",
-        fontSize=9,
-        leading=13,
-        textColor=DARK_TEXT,
-        fontName="Helvetica",
-        spaceBefore=0,
-        spaceAfter=6,
-        leftIndent=0,
-        alignment=TA_JUSTIFY,
-    ))
-    styles.add(ParagraphStyle(
-        name="BulletText", fontSize=9, leading=13, textColor=DARK_TEXT,
-        fontName="Helvetica-Bold", spaceAfter=1, spaceBefore=6,
-        leftIndent=12, bulletIndent=0, alignment=TA_LEFT,
-    ))
-    styles.add(ParagraphStyle(
-        name="BodyProse", fontSize=9, leading=13, textColor=DARK_TEXT,
-        fontName="Helvetica", spaceAfter=3, alignment=TA_JUSTIFY,
-    ))
-    styles.add(ParagraphStyle(
-        name="BottomLine", fontSize=9, leading=13, textColor=DARK_TEXT,
-        fontName="Helvetica-Bold", spaceAfter=3, spaceBefore=2,
-    ))
-    styles.add(ParagraphStyle(
-        name="SnapshotLabel", fontSize=8, leading=10, textColor=GREY,
-        fontName="Helvetica-Bold", spaceAfter=0,
-    ))
-    styles.add(ParagraphStyle(
-        name="SnapshotValue", fontSize=9, leading=11, textColor=DARK_TEXT,
-        fontName="Helvetica-Bold", spaceAfter=0,
-    ))
-    styles.add(ParagraphStyle(
-        name="FooterText", fontSize=7, leading=9, textColor=GREY,
-        fontName="Helvetica",
-    ))
-    return styles
-
-
-def parse_narrative_to_flowables(narrative: str, styles) -> list:
-    """
-    Parse the Gemini narrative into ReportLab flowables.
-
-    KEY INSIGHTS section:
-      Lines starting with "Insight: "       → InsightHeadline style (bold blue)
-      Lines starting with "Why it matters:" → InsightBody style (dark text)
-
-    All other sections map headings → SectionHeader, body → BodyProse.
-    """
-    flow = []
-    current_section = None
-
-    for line in narrative.split("\n"):
-        stripped = line.strip()
-        if not stripped:
-            continue
-
-        # Strip markdown bold markers
-        stripped = stripped.replace("**", "")
-
-        # ── Section heading detection ────────────────────────────────
-        if stripped.startswith("## HEADLINE"):
-            current_section = "headline"
-            continue
-        elif stripped.startswith("## INDICATION LANDSCAPE"):
-            current_section = "landscape"
-            flow.append(Spacer(1, 4))
-            flow.append(Paragraph("INDICATION LANDSCAPE", styles["SectionHeader"]))
-            flow.append(Spacer(1, 4))
-            continue
-        elif stripped.startswith("## KEY INSIGHTS"):
-            current_section = "insights"
-            flow.append(Spacer(1, 4))
-            flow.append(Paragraph("KEY INSIGHTS", styles["SectionHeader"]))
-            flow.append(Spacer(1, 2))
-            continue
-        elif stripped.startswith("## EVIDENCE GAPS"):
-            current_section = "gaps"
-            flow.append(Spacer(1, 4))
-            flow.append(Paragraph("EVIDENCE GAPS &amp; RISKS", styles["SectionHeader"]))
-            flow.append(Spacer(1, 4))
-            continue
-        elif stripped.startswith("## EXPANSION INDICATIONS"):
-            current_section = "expansion"
-            flow.append(Spacer(1, 4))
-            flow.append(Paragraph("EXPANSION INDICATIONS", styles["SectionHeader"]))
-            flow.append(Spacer(1, 2))
-            continue
-        elif stripped.startswith("## BOTTOM LINE"):
-            current_section = "bottom"
-            flow.append(Spacer(1, 4))
-            flow.append(Paragraph("BOTTOM LINE", styles["SectionHeader"]))
-            flow.append(Spacer(1, 3))
-            continue
-        elif stripped.startswith("## "):
-            heading = stripped[3:].strip()
-            current_section = "other"
-            flow.append(Spacer(1, 4))
-            flow.append(Paragraph(escape_html(heading), styles["SectionHeader"]))
-            flow.append(Spacer(1, 3))
-            continue
-
-        # ── Content rendering by section ────────────────────────────
-        if current_section == "headline":
-            flow.append(Paragraph(escape_html(stripped), styles["Headline"]))
-
-        elif current_section == "landscape":
-            flow.append(Paragraph(escape_html(stripped), styles["BodyProse"]))
-
-        elif current_section == "insights":
-            # Strip leading list markers if Gemini adds them
-            if stripped.startswith("- ") or stripped.startswith("* "):
-                stripped = stripped[2:].strip()
-
-            # ── "Insight: <headline text>" ───────────────────────────
-            insight_match = re.match(r'^[Ii]nsight\s*\d*\s*[:.\-]\s*(.*)', stripped)
-            if insight_match:
-                headline_text = insight_match.group(1).strip()
-                html = f'<font color="#2E75B6"><b>{escape_html(headline_text)}</b></font>'
-                flow.append(Paragraph(html, styles["InsightHeadline"]))
-                continue
-
-            # ── "Why it matters: <body text>" ───────────────────────
-            why_match = re.match(
-                r'^[Ww]hy\s+[Ii]t\s+[Mm]atters\s*[:.\-]\s*(.*)', stripped
-            )
-            if why_match:
-                body_text = why_match.group(1).strip()
-                flow.append(Paragraph(escape_html(body_text), styles["InsightBody"]))
-                continue
-
-            # Fallback: any other line in insights section → plain bullet
-            if stripped:
-                flow.append(Paragraph(
-                    f"&bull;&nbsp;&nbsp;{escape_html(stripped)}",
-                    styles["BulletText"]
-                ))
-
-        elif current_section == "gaps":
-            if stripped.startswith("- ") or stripped.startswith("* "):
-                text = stripped[2:].strip()
-            else:
-                text = stripped
-            # Skip lines about peer-reviewed journals / publications
-            lower = text.lower()
-            if any(kw in lower for kw in ["peer-review", "peer review", "journal",
-                                           "publication", "published", "publishing"]):
-                continue
-            if text:
-                flow.append(Paragraph(
-                    f"&bull;&nbsp;&nbsp;{escape_html(text)}",
-                    styles["BulletText"]
-                ))
-
-        elif current_section == "expansion":
-            # Strip leading list markers if Gemini adds them
-            if stripped.startswith("- ") or stripped.startswith("* "):
-                stripped = stripped[2:].strip()
-
-            # ── "Indication: <name>" ─────────────────────────────────
-            ind_match = re.match(r'^[Ii]ndication\s*\d*\s*[:.\-]\s*(.*)', stripped)
-            if ind_match:
-                ind_text = ind_match.group(1).strip()
-                html = f'<font color="#2E75B6"><b>{escape_html(ind_text)}</b></font>'
-                flow.append(Paragraph(html, styles["InsightHeadline"]))
-                continue
-
-            # ── "Rationale: <explanation>" ────────────────────────────
-            rat_match = re.match(r'^[Rr]ationale\s*[:.\-]\s*(.*)', stripped)
-            if rat_match:
-                body_text = rat_match.group(1).strip()
-                flow.append(Paragraph(escape_html(body_text), styles["InsightBody"]))
-                continue
-
-            # Fallback: any other line → plain body text
-            if stripped:
-                flow.append(Paragraph(escape_html(stripped), styles["BodyProse"]))
-
-        elif current_section == "bottom":
-            flow.append(Paragraph(escape_html(stripped), styles["BottomLine"]))
-
-        else:
-            flow.append(Paragraph(escape_html(stripped), styles["BodyProse"]))
-
-    return flow
-
-
-def generate_pdf_report(molecule_name: str, data: dict, out_path: Path,
-                        gemini_narrative: str | None = None,
-                        innovator_name: str | None = None):
-    """Generate a compact, business-facing PDF (target: 2 pages max)."""
-    styles = build_styles()
-    doc = SimpleDocTemplate(
-        str(out_path), pagesize=letter,
-        topMargin=0.5 * inch, bottomMargin=0.5 * inch,
-        leftMargin=0.6 * inch, rightMargin=0.6 * inch,
-        title=f"Label Expansion Report - {molecule_name}",
-    )
-    story = []
-
-    generic_name = data.get("molecule_name", molecule_name)
-    sponsor = innovator_name or data.get("company_name", "Unknown")
-
-    # ---------- Title ----------
-    story.append(Paragraph("Label Expansion Report", styles["ReportTitle"]))
-    story.append(Paragraph(
-        f"Molecule: <b>{escape_html(generic_name)}</b>"
-        f"&nbsp;&nbsp;|&nbsp;&nbsp;Innovator: {escape_html(sponsor)}"
-        f"&nbsp;&nbsp;|&nbsp;&nbsp;{datetime.now().strftime('%B %d, %Y')}",
-        styles["ReportSubtitle"]
-    ))
-
-    # Show primary indications and therapy areas in subtitle
-    primary = data.get("primary_indications", [])
-    therapy_areas = data.get("therapy_areas", [])
-    if primary or therapy_areas:
-        meta_parts = []
-        if primary:
-            meta_parts.append(f"Primary: {', '.join(primary[:4])}")
-        if therapy_areas:
-            meta_parts.append(f"Therapy Areas: {', '.join(therapy_areas[:5])}")
-        story.append(Paragraph("&nbsp;&nbsp;|&nbsp;&nbsp;".join(meta_parts),
-                               styles["ReportSubtitle"]))
-
-    story.append(Spacer(1, 4))
-    story.append(HRFlowable(width="100%", thickness=1, color=NAVY))
-    story.append(Spacer(1, 6))
-
-    # ---------- Snapshot bar (compact stats) ----------
-    total_indications = data.get("total_indications", 0)
-    n_primary = len(data.get("primary_indications", []))
-    n_secondary = len(data.get("secondary_indications", []))
-    n_therapy_areas = len(data.get("therapy_areas", []))
-
-    snap_data = [
-        ("Indications", str(total_indications)),
-        ("Primary", str(n_primary)),
-        ("Secondary", str(n_secondary)),
-        ("Therapy Areas", str(n_therapy_areas)),
-    ]
-    snap_cells = []
-    for label, val in snap_data:
-        snap_cells.append([
-            Paragraph(val, ParagraphStyle("sv", parent=styles["SnapshotValue"],
-                                          textColor=NAVY)),
-            Paragraph(label, styles["SnapshotLabel"]),
-        ])
-
-    snap_table = Table([snap_cells], colWidths=[1.65 * inch] * 4,
-                       rowHeights=[0.4 * inch])
-    snap_table.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F5F7FA")),
-        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
-        ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#E0E0E0")),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ]))
-    story.append(snap_table)
-    story.append(Spacer(1, 8))
-
-    # ---------- Gemini narrative (the core of the report) ----------
-    if gemini_narrative:
-        flow = parse_narrative_to_flowables(gemini_narrative, styles)
-        story.extend(flow)
-    else:
-        # Fallback: structured summary from data
-        story.append(Paragraph("EXECUTIVE SUMMARY", styles["SectionHeader"]))
-        story.append(Spacer(1, 4))
-
-        primary_str = ", ".join(data.get("primary_indications", [])[:5]) or "not identified"
-        secondary_str = ", ".join(data.get("secondary_indications", [])[:5]) or "none identified"
-        ta_str = ", ".join(data.get("therapy_areas", [])) or "not classified"
-
-        summary = (
-            f"{generic_name} has {total_indications} distinct indications identified. "
-            f"Primary indications include {primary_str}. "
-            f"Secondary (expansion) indications include {secondary_str}. "
-            f"The molecule spans {n_therapy_areas} therapy area(s): {ta_str}."
-        )
-        story.append(Paragraph(escape_html(summary), styles["BodyProse"]))
-
-        secondary_inds = data.get("secondary_indications", [])
-        rationales_map = data.get("secondary_indication_rationales", {})
-        if secondary_inds:
-            story.append(Spacer(1, 4))
-            story.append(Paragraph("EXPANSION INDICATIONS", styles["SectionHeader"]))
-            story.append(Spacer(1, 3))
-            for ind in secondary_inds[:10]:
-                info = rationales_map.get(ind, {})
-                rationale = info.get("rationale", "")
-                ta = info.get("therapy_area", "")
-                phase = info.get("phase", "")
-
-                # Headline: indication name (bold blue)
-                html = f'<font color="#2E75B6"><b>{escape_html(ind)}</b></font>'
-                if ta:
-                    html += f'&nbsp;&nbsp;<font color="#666666">({escape_html(ta)})</font>'
-                if phase:
-                    html += f'&nbsp;&nbsp;<font color="#666666">| {escape_html(phase)}</font>'
-                story.append(Paragraph(html, styles["InsightHeadline"]))
-
-                # Body: rationale explaining why it is secondary
-                if rationale:
-                    story.append(Paragraph(escape_html(rationale), styles["InsightBody"]))
-                else:
-                    story.append(Paragraph(
-                        "Classified as a label expansion beyond the primary approved indication.",
-                        styles["InsightBody"]
-                    ))
-
-        story.append(Spacer(1, 6))
-        story.append(Paragraph(
-            "AI narrative was not generated (GEMINI_API_KEY missing or API error).",
-            styles["BodyProse"]
-        ))
-
-    # ---------- Footer ----------
-    story.append(Spacer(1, 10))
-    story.append(HRFlowable(width="100%", thickness=0.5,
-                            color=colors.HexColor("#CCCCCC")))
-    footer_parts = [f"Report generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"]
-    if gemini_narrative:
-        footer_parts.append("Analytical narrative generated by Gemini 2.5 Flash")
-    story.append(Paragraph("  |  ".join(footer_parts), styles["FooterText"]))
-
-    doc.build(story)
-
-
-# ---------------------------------------------------------------------
-# Per-molecule processing
-# ---------------------------------------------------------------------
-
-def process_molecule(molecule_name: str, output_dir: str, report_dir: Path) -> bool:
-    excel_path = find_excel_file(output_dir, molecule_name)
-    if not excel_path:
-        print(f"  [ERR] No Excel file found for '{molecule_name}' in {output_dir}",
-              file=sys.stderr)
-        print(f"        Run run_all.py or label.py first to generate data.",
-              file=sys.stderr)
-        return False
-
-    print(f"  [OK]  Found Excel file: {excel_path}")
-
-    # Read and extract data
-    rows = read_excel_data(excel_path)
-    if not rows:
-        print(f"  [ERR] No data rows found in {excel_path}", file=sys.stderr)
-        return False
-
-    data = extract_label_data(rows, molecule_name)
-    resolved_name = data["molecule_name"]
-    print(f"  [OK]  Extracted data for: {resolved_name}")
-    print(f"        Indications: {data['total_indications']} | "
-          f"Primary: {len(data['primary_indications'])} | "
-          f"Secondary: {len(data['secondary_indications'])} | "
-          f"Therapy Areas: {len(data['therapy_areas'])}")
-
-    # Generate narrative
-    gemini_narrative = generate_gemini_narrative(resolved_name, data)
-
-    # Resolve innovator
-    company_hint = data.get("company_name", "")
-    innovator_name = lookup_innovator(resolved_name, company_hint) or company_hint or None
-
-    safe = re.sub(r"[^a-zA-Z0-9]", "_", str(resolved_name).lower())
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = report_dir / f"{safe}_label_expansion_report_{ts}.pdf"
-
-    generate_pdf_report(
-        molecule_name=resolved_name,
-        data=data,
-        out_path=out_path,
-        gemini_narrative=gemini_narrative,
-        innovator_name=innovator_name,
-    )
-    print(f"  [OK]  PDF written -> {out_path}")
-    return True
-
-
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Generate business-facing PDF label expansion reports from Excel data"
-    )
-    parser.add_argument(
-        "--molecule", "-m", nargs="+", required=True, metavar="MOLECULE",
-        help="One or more molecule names",
-    )
-    parser.add_argument(
-        "--output-dir", default=DEFAULT_OUTPUT_DIR,
-        help=f"Directory containing *_research.xlsx or *_clinical_efficacy.xlsx files "
-             f"(default: '{DEFAULT_OUTPUT_DIR}')",
-    )
-    parser.add_argument(
-        "--report-dir", default=None,
-        help="Where to save the generated PDFs (default: same as --output-dir)",
-    )
-    args = parser.parse_args()
-
-    output_dir = args.output_dir
-    report_dir = Path(args.report_dir) if args.report_dir else Path(output_dir)
-    report_dir.mkdir(parents=True, exist_ok=True)
-
-    molecules = args.molecule
-    print(f"\nProcessing {len(molecules)} molecule(s): {', '.join(molecules)}\n")
-
-    results = {}
-    for molecule in molecules:
-        print(f"--- {molecule} ---")
-        ok = process_molecule(molecule, output_dir, report_dir)
-        results[molecule] = ok
-        print()
-
-    succeeded = [m for m, ok in results.items() if ok]
-    failed = [m for m, ok in results.items() if not ok]
-
-    print("=" * 50)
-    print(f"Done. {len(succeeded)}/{len(molecules)} report(s) generated successfully.")
-    if failed:
-        print(f"Failed: {', '.join(failed)}", file=sys.stderr)
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+insertId	labels.container_name	labels.instanceId	'labels."run.googleapis.com/execution_name"	'labels."run.googleapis.com/task_attempt"	'labels."run.googleapis.com/task_index"	logName	receiveLocation	receiveTimestamp	resource.labels.job_name	resource.labels.location	resource.labels.project_id	resource.type	severity	textPayload	timestamp
+6a56e8830004e5a2f6f83ad6	'ip-dim-scoring-job-1	002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fvarlog%2Fsystem		'2026-07-15T01:55:15.332466597Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job	INFO	Container called exit(0).	'2026-07-15T01:55:15.320873Z
+6a56e882000c953286b9457b		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:15.152351711Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•[0m	'2026-07-15T01:55:14.824626Z
+6a56e882000c952d2713f0fc		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:15.152351711Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  DONE â€” 90.6s (1.5 min)	'2026-07-15T01:55:14.824621Z
+6a56e882000c9528ce43f730		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:15.152351711Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[1mâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•	'2026-07-15T01:55:14.824616Z
+6a56e882000c95200c041ca3		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:15.152351711Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  [92mâœ“ Patents â€” all 1 drug(s) completed[0m	'2026-07-15T01:55:14.824608Z
+6a56e882000c7b133d0158bd		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:15.152351711Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  [92m[1/1] âœ“ Orforglipron Calcium[0m	'2026-07-15T01:55:14.817939Z
+6a56e882000c78ac061982f8		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:15.152351711Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  [92mâœ“ Done in 14.1s[0m	'2026-07-15T01:55:14.817324Z
+6a56e882000568b65bf9fd59		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:14.481910646Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'============================================================	'2026-07-15T01:55:14.354486Z
+6a56e882000568b2eaf3a67f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:14.481910646Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  âœ“ Done	'2026-07-15T01:55:14.354482Z
+6a56e882000568ae0be8be16		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:14.481910646Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'============================================================	'2026-07-15T01:55:14.354478Z
+6a56e882000567c4f68f6657		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:14.481910646Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[BQ] âœ“ Upload complete â€” 135 row(s) â†’ cognito-prod-394707.cognito_prod_datamart.loe_table_2	'2026-07-15T01:55:14.354244Z
+6a56e882000567b86c1203ff		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstderr		'2026-07-15T01:55:14.361467710Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'100%|â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆ| 1/1 [00:00<00:00, 20068.44it/s]	'2026-07-15T01:55:14.354232Z
+6a56e882000567a07ba87685		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstderr		'2026-07-15T01:55:14.361467710Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  0%|          | 0/1 [00:00<?, ?it/s]	'2026-07-15T01:55:14.354208Z
+6a56e87c000ac8f75a9dc55b		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.820735956Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[BQ] Appending to existing table...	'2026-07-15T01:55:08.706807Z
+6a56e87c000491c8eb8a7898		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'Orforglipron Calcium AU2020223687B2           AU     BLOCKING  2020-08-26 Phase 3             NaN                     1	'2026-07-15T01:55:08.299464Z
+6a56e87c000491c556595494		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'Orforglipron Calcium AU2020223687A1           AU NON-BLOCKING  2020-08-26 Phase 3             NaN                     1	'2026-07-15T01:55:08.299461Z
+6a56e87c000491c1458517e2		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'Orforglipron Calcium AU2017330733B2           AU     BLOCKING  2017-09-26 Phase 3             NaN                     1	'2026-07-15T01:55:08.299457Z
+6a56e87c000491b9769bb671		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		           Drug_Name  Patent_Number Jurisdiction          Tag Filing_Date   Phase  Years_to_Entry  IP_Dimension_1_Score	'2026-07-15T01:55:08.299449Z
+6a56e87c00045f18319d1e33		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[BQ] First 3 rows preview:	'2026-07-15T01:55:08.286488Z
+6a56e87c00045f14fc3f515e		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[BQ] Drug(s): ['Orforglipron Calcium']	'2026-07-15T01:55:08.286484Z
+6a56e87c00045cba9ec04fd2		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      47. Source_File	'2026-07-15T01:55:08.285882Z
+6a56e87c00045cb76c5419a5		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      46. IP_Dimension_1_Score	'2026-07-15T01:55:08.285879Z
+6a56e87c00045cb4434c6263		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      45. Avg_Years_to_Entry_US_EP	'2026-07-15T01:55:08.285876Z
+6a56e87c00045cb08d04459a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      44. Score	'2026-07-15T01:55:08.285872Z
+6a56e87c00045cad0760a05f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      43. Avg_Years_to_Entry	'2026-07-15T01:55:08.285869Z
+6a56e87c00045caa35bdbdcc		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      42. Years_to_Entry	'2026-07-15T01:55:08.285866Z
+6a56e87c00045ca715a09db0		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      41. Controlling_Patent_Expiry_Year	'2026-07-15T01:55:08.285863Z
+6a56e87c00045ca329903392		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      40. Exclusivity_Year	'2026-07-15T01:55:08.285859Z
+6a56e87c00045ca0bcc116e0		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      39. Est_Approval_Year	'2026-07-15T01:55:08.285856Z
+6a56e87c00045c9c9db3a68b		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      38. Approval_Date_Source	'2026-07-15T01:55:08.285852Z
+6a56e87c00045c990b2dc735		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      37. Approval_Date	'2026-07-15T01:55:08.285849Z
+6a56e87c00045c53b897548d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      36. Launch_Date	'2026-07-15T01:55:08.285779Z
+6a56e87c00045c509c15ff7a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      35. Phase	'2026-07-15T01:55:08.285776Z
+6a56e87c00045c4df9d1f44a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      34. Pediatric_Exclusivity	'2026-07-15T01:55:08.285773Z
+6a56e87c00045c497227d565		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      33. PTE_months	'2026-07-15T01:55:08.285769Z
+6a56e87c00045c46911de388		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      32. Grant_Date	'2026-07-15T01:55:08.285766Z
+6a56e87c00045c4353cc8728		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      31. Filing_Date	'2026-07-15T01:55:08.285763Z
+6a56e87c00045c4048628e0d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      30. Step_5_Reason	'2026-07-15T01:55:08.285760Z
+6a56e87c00045c3c93d2dd3c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      29. Step_5_Confidence	'2026-07-15T01:55:08.285756Z
+6a56e87c00045c39750cf02a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      28. Step_5_Complex_Implementation	'2026-07-15T01:55:08.285753Z
+6a56e87c00045c36f8d78466		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      27. Step_5_Prior_Failed_Attempts	'2026-07-15T01:55:08.285750Z
+6a56e87c00045c32fa3bc084		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      26. Step_5_First_in_Class	'2026-07-15T01:55:08.285746Z
+6a56e87c00045c2e303e4050		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      25. Step_5_Novelty_Signal	'2026-07-15T01:55:08.285742Z
+6a56e87c00045c2ba5ecd1a2		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      24. Step_5_Novel_Difficult	'2026-07-15T01:55:08.285739Z
+6a56e87c00045bddd8137608		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      23. Step_4_Reason	'2026-07-15T01:55:08.285661Z
+6a56e87c00045bdafb3a62c7		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      22. Step_4_Formulation_Consistent_Across_Phases	'2026-07-15T01:55:08.285658Z
+6a56e87c00045bd6f806df8f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      21. Step_4_Bridging_Studies_Required	'2026-07-15T01:55:08.285654Z
+6a56e87c00045baf80bee643		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      20. Step_4_Regulatory_Failure_if_Removed	'2026-07-15T01:55:08.285615Z
+6a56e87c00045babefbc6e7d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      19. Step_4_Confidence	'2026-07-15T01:55:08.285611Z
+6a56e87c00045ba8737be7d5		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      18. Step_4_Blocking_Indicator	'2026-07-15T01:55:08.285608Z
+6a56e87c00045ba53404848a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      17. Step_3_Evidence_Summary	'2026-07-15T01:55:08.285605Z
+6a56e87c00045ba15da8d314		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      16. Step_3_Evidence_Type	'2026-07-15T01:55:08.285601Z
+6a56e87c00045b9ead4f05d2		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      15. Step_3_Confidence	'2026-07-15T01:55:08.285598Z
+6a56e87c00045b9ab3b009f5		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      14. Step_3_Technical_Barrier	'2026-07-15T01:55:08.285594Z
+6a56e87c00045b9714605223		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      13. S2_Combination_Tech_Process	'2026-07-15T01:55:08.285591Z
+6a56e87c00045b94518fcd27		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      12. S2_Device_Description	'2026-07-15T01:55:08.285588Z
+6a56e87c00045b90a7477213		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      11. S2_Route_of_Administration	'2026-07-15T01:55:08.285584Z
+6a56e87c00045b8d14e1065c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		      10. S2_Formulation_Details	'2026-07-15T01:55:08.285581Z
+6a56e87c00045b89e3a4d264		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		       9. S2_Active_Ingredient_Form	'2026-07-15T01:55:08.285577Z
+6a56e87c00045b84261678e4		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		       8. Step_2_Matched_Elements	'2026-07-15T01:55:08.285572Z
+6a56e87c00045b8115687df2		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		       7. Step_1_Claim_Category	'2026-07-15T01:55:08.285569Z
+6a56e87c00045b7d156e0a8c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		       6. Reason	'2026-07-15T01:55:08.285565Z
+6a56e87c00045b7a0dc4bf67		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		       5. Blocking_Category	'2026-07-15T01:55:08.285562Z
+6a56e87c00045b76a8ee353a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		       4. Tag	'2026-07-15T01:55:08.285558Z
+6a56e87c00045b73e9d1dcb4		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		       3. Jurisdiction	'2026-07-15T01:55:08.285555Z
+6a56e87c00045b6f5a1d4bb1		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		       2. Patent_Number	'2026-07-15T01:55:08.285551Z
+6a56e87c00045b6a6cc955bb		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		       1. Drug_Name	'2026-07-15T01:55:08.285546Z
+6a56e87c00045b387d386c29		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[BQ] Column names:	'2026-07-15T01:55:08.285496Z
+6a56e87c00045b33d79b26ee		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€	'2026-07-15T01:55:08.285491Z
+6a56e87c00045b2ecd2c88b2		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[BQ] Columns:  47	'2026-07-15T01:55:08.285486Z
+6a56e87c00045b2a37d55790		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[BQ] Rows:     135	'2026-07-15T01:55:08.285482Z
+6a56e87c00045b27ccd476c5		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[BQ] Location: asia-south1	'2026-07-15T01:55:08.285479Z
+6a56e87c00045b229f1c8c78		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[BQ] Target:   cognito-prod-394707.cognito_prod_datamart.loe_table_2	'2026-07-15T01:55:08.285474Z
+6a56e87c00045b1a98e250b2		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€	'2026-07-15T01:55:08.285466Z
+6a56e87c00044983d13cee35		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[TOTAL] 135 row(s) from 1 drug(s)	'2026-07-15T01:55:08.280963Z
+6a56e87c00041fbcab0c8b01		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[ROWS] 'Orforglipron Calcium' â†’ 135 row(s) built	'2026-07-15T01:55:08.270268Z
+6a56e87c00041a32215c6a04		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:08.489524769Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[CACHE] Loaded 'Orforglipron Calcium' â€” 135 patent(s), analysed: 2026-06-25	'2026-07-15T01:55:08.268850Z
+6a56e8790002424e555b88f7		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:05.158771600Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[DRUG FILTER] 81 allowed GLP-1 drug name(s) loaded from cognito-prod-394707.cognito_prod_datamart.vw_drug_details_full	'2026-07-15T01:55:05.148046Z
+6a56e877000b0186dbae998f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:03.827878749Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'============================================================	'2026-07-15T01:55:03.721286Z
+6a56e877000b01834f06715f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:03.827878749Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  Target:  cognito-prod-394707.cognito_prod_datamart.loe_table_2	'2026-07-15T01:55:03.721283Z
+6a56e877000b017ff630f6ec		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:03.827878749Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  Cache:   GCS (results_cache)	'2026-07-15T01:55:03.721279Z
+6a56e877000b017b6dc9481b		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:03.827878749Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  LOE â†’ BigQuery (direct upload)	'2026-07-15T01:55:03.721275Z
+6a56e877000b01740d53b646		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:03.827878749Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'============================================================	'2026-07-15T01:55:03.721268Z
+6a56e877000afee6348c6bbe		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:03.827878749Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[FORMULATION EXCEL] WARNING: No path provided and FORMULATION_EXCEL_PATH not set â€” Step 2 will run without Excel data.	'2026-07-15T01:55:03.720614Z
+6a56e877000af775fbd0837e		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:03.827878749Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[BQ] Config loaded: cognito-prod-394707.cognito_prod_datamart.clinical_efficacy | drug_details: cognito-prod-394707.cognito_prod_datamart.vw_drug_details	'2026-07-15T01:55:03.718709Z
+6a56e87700004d131583c05b		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:03.158388694Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[ALLOYDB] Client initialized	'2026-07-15T01:55:03.019731Z
+6a56e8750004730b44cc3dc8		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:01.493611141Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[GCS] Config loaded: gs://cognito-gcs/Cognito_new/Master_patent_list/	'2026-07-15T01:55:01.291595Z
+6a56e874000b3d90214b5a48		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.830907123Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  cmd: /usr/local/bin/python /app/Pipeline/2bq.py --drug Orforglipron Calcium	'2026-07-15T01:55:00.736656Z
+6a56e874000b3d8aab9b18f9		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.830907123Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[93mâ–¶ BQ upload: Orforglipron Calcium[0m	'2026-07-15T01:55:00.736650Z
+6a56e874000b3cb47efdf2ec		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.830907123Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  [92mâœ“ Done in 61.1s[0m	'2026-07-15T01:55:00.736436Z
+6a56e8740002ad190073471a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[DONE] Total wall time: 57.7s	'2026-07-15T01:55:00.175385Z
+6a56e8740002abc54c107af1		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  Combined Excel: gs://cognito-gcs/pipeline_cache/patent_exports/combined_20260715.xlsx	'2026-07-15T01:55:00.175045Z
+6a56e8740002abc3fa2da9d4		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  Excel         : gs://cognito-gcs/pipeline_cache/patent_exports/Orforglipron_Calcium_20260715.xlsx	'2026-07-15T01:55:00.175043Z
+6a56e8740002abbfc0960722		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ WO_2018026914_A1.pdf	'2026-07-15T01:55:00.175039Z
+6a56e8740002abbc7cd48d62		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ WO_2024137426_A1.pdf	'2026-07-15T01:55:00.175036Z
+6a56e8740002abb3cd9185a9		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ WO_2024129676_A1.pdf	'2026-07-15T01:55:00.175027Z
+6a56e8740002abb111d5e220		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ WO_2023220112_A1.pdf	'2026-07-15T01:55:00.175025Z
+6a56e8740002abad14e3df4c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ WO_2023220109_A1.pdf	'2026-07-15T01:55:00.175021Z
+6a56e8740002abaac1f535bb		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ WO_2022060817_A2.pdf	'2026-07-15T01:55:00.175018Z
+6a56e8740002aba8224bb403		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ WO_2007002052_A2.pdf	'2026-07-15T01:55:00.175016Z
+6a56e8740002aba5ea1d40e5		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ WO2025259825.pdf	'2026-07-15T01:55:00.175013Z
+6a56e8740002aba2f9ea463d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ WO2024137426A1.pdf	'2026-07-15T01:55:00.175010Z
+6a56e8740002aba0bf094cb4		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ WO2024129676A1.pdf	'2026-07-15T01:55:00.175008Z
+6a56e8740002ab8860eb851d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ WO2024050289A1.pdf	'2026-07-15T01:55:00.174984Z
+6a56e8740002ab86c3da41bb		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ WO2023220112A1.pdf	'2026-07-15T01:55:00.174982Z
+6a56e8740002ab838462cf91		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ WO2023220109A1.pdf	'2026-07-15T01:55:00.174979Z
+6a56e8740002ab6562143d55		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ WO2018056453A1.pdf	'2026-07-15T01:55:00.174949Z
+6a56e8740002ab63abab4952		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ WO2013032779A2.pdf	'2026-07-15T01:55:00.174947Z
+6a56e8740002ab60048b2778		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ WO2011109205A2.pdf	'2026-07-15T01:55:00.174944Z
+6a56e8740002ab5d2cd0e054		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ WO2010104779A1.pdf	'2026-07-15T01:55:00.174941Z
+6a56e8740002ab5bd9e09ee1		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ WO2005097233A2.pdf	'2026-07-15T01:55:00.174939Z
+6a56e8740002ab57942f4f13		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ WO2000071191A2.pdf	'2026-07-15T01:55:00.174935Z
+6a56e8740002ab415c77739f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US_D1092726_S.pdf	'2026-07-15T01:55:00.174913Z
+6a56e8740002ab3e8e48a7f7		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US_2025325525_A1.pdf	'2026-07-15T01:55:00.174910Z
+6a56e8740002ab381b1c18df		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US_2025302809_A1.pdf	'2026-07-15T01:55:00.174904Z
+6a56e8740002ab35484b8098		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US_2025092041_A1.pdf	'2026-07-15T01:55:00.174901Z
+6a56e8740002ab339f140a10		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US_12410168_B2.pdf	'2026-07-15T01:55:00.174899Z
+6a56e8740002ab300c9cdd5d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US_12365682_B2.pdf	'2026-07-15T01:55:00.174896Z
+6a56e8740002ab2dba881c6a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ USRE50455E1.pdf	'2026-07-15T01:55:00.174893Z
+6a56e8740002ab2958b040b9		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ USRE50455E.pdf	'2026-07-15T01:55:00.174889Z
+6a56e8740002ab279d611994		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ USRE49091E1.pdf	'2026-07-15T01:55:00.174887Z
+6a56e8740002ab246a8bc195		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ USRE48006E1.pdf	'2026-07-15T01:55:00.174884Z
+6a56e8740002ab21543d8416		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US9925337B2.pdf	'2026-07-15T01:55:00.174881Z
+6a56e8740002ab1ee97493a8		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US9474780B2.pdf	'2026-07-15T01:55:00.174878Z
+6a56e8740002ab1b200410d9		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US9402957B2.pdf	'2026-07-15T01:55:00.174875Z
+6a56e8740002ab195c205ad2		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US7678084B2.pdf	'2026-07-15T01:55:00.174873Z
+6a56e8740002ab16b07590e1		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US7291132B2.pdf	'2026-07-15T01:55:00.174870Z
+6a56e8740002ab1367535494		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US6454746B1.pdf	'2026-07-15T01:55:00.174867Z
+6a56e8740002ab07fc572731		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US6221046B1.pdf	'2026-07-15T01:55:00.174855Z
+6a56e8740002ab05edb64e66		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US5584815A.pdf	'2026-07-15T01:55:00.174853Z
+6a56e8740002ab0258c9d082		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US5545147A.pdf	'2026-07-15T01:55:00.174850Z
+6a56e8740002ab00a2fa3cbd		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US5505704A.pdf	'2026-07-15T01:55:00.174848Z
+6a56e8740002aafdffe7e3f5		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US5383865A.pdf	'2026-07-15T01:55:00.174845Z
+6a56e8740002aafaaffcf6d6		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US5226896A.pdf	'2026-07-15T01:55:00.174842Z
+6a56e8740002aaf70f6d1ad0		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US5226895A.pdf	'2026-07-15T01:55:00.174839Z
+6a56e8740002aae37f6c6588		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US2025302809.pdf	'2026-07-15T01:55:00.174819Z
+6a56e8740002aae1fc15e7ba		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US2025092041.pdf	'2026-07-15T01:55:00.174817Z
+6a56e8740002aade1f7c8eb1		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US20250042899A1.pdf	'2026-07-15T01:55:00.174814Z
+6a56e8740002aabef5530911		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US20230381098A1.pdf	'2026-07-15T01:55:00.174782Z
+6a56e8740002aabbefd498bb		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US20190225604A1.pdf	'2026-07-15T01:55:00.174779Z
+6a56e8740002aab81317ea85		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US20190030249A1.pdf	'2026-07-15T01:55:00.174776Z
+6a56e8740002aab6a81be55e		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US20130184653A1.pdf	'2026-07-15T01:55:00.174774Z
+6a56e8740002aab243eb5083		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US19A.pdf	'2026-07-15T01:55:00.174770Z
+6a56e8740002aab032594ec1		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US18A.pdf	'2026-07-15T01:55:00.174768Z
+6a56e8740002aaadaf38681a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US12564687.pdf	'2026-07-15T01:55:00.174765Z
+6a56e8740002aaab57118061		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US12558491.pdf	'2026-07-15T01:55:00.174763Z
+6a56e8740002aaa8bb95c52f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US12505906B2.pdf	'2026-07-15T01:55:00.174760Z
+6a56e8740002aaa5dd2e37b7		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US12505906.pdf	'2026-07-15T01:55:00.174757Z
+6a56e8740002aa45ad120e23		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US12410168.pdf	'2026-07-15T01:55:00.174661Z
+6a56e8740002aa42bda9316e		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US12365682.pdf	'2026-07-15T01:55:00.174658Z
+6a56e8740002aa40c108eb14		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US12331050B2.pdf	'2026-07-15T01:55:00.174656Z
+6a56e8740002aa3d7aa54291		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US12331049B2.pdf	'2026-07-15T01:55:00.174653Z
+6a56e8740002aa3ac9bab2ee		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US12319658B2.pdf	'2026-07-15T01:55:00.174650Z
+6a56e8740002aa38ea82b48c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US12252524B2.pdf	'2026-07-15T01:55:00.174648Z
+6a56e8740002aa35624c90be		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US12239816B2.pdf	'2026-07-15T01:55:00.174645Z
+6a56e8740002aa3302da188c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US12226619B2.pdf	'2026-07-15T01:55:00.174643Z
+6a56e8740002aa315ef65064		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US12187724B2.pdf	'2026-07-15T01:55:00.174641Z
+6a56e8740002aa2e360df763		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US12156739B2.pdf	'2026-07-15T01:55:00.174638Z
+6a56e8740002aa2c96fbd4bf		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US12083324B2.pdf	'2026-07-15T01:55:00.174636Z
+6a56e8740002aa282abdbc97		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US12011574B2.pdf	'2026-07-15T01:55:00.174632Z
+6a56e8740002aa264a325558		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US11957882B2.pdf	'2026-07-15T01:55:00.174630Z
+6a56e8740002aa249d60866a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US11918792B2.pdf	'2026-07-15T01:55:00.174628Z
+6a56e8740002aa1af1aa30ac		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US11814381B2.pdf	'2026-07-15T01:55:00.174618Z
+6a56e8740002aa174bc517aa		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US11771837B2.pdf	'2026-07-15T01:55:00.174615Z
+6a56e8740002aa155e9c22ef		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US11554221B2.pdf	'2026-07-15T01:55:00.174613Z
+6a56e8740002aa12e3abbced		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US11542313B2.pdf	'2026-07-15T01:55:00.174610Z
+6a56e8740002aa0f552ebd55		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US11179522B2.pdf	'2026-07-15T01:55:00.174607Z
+6a56e8740002aa09477e4645		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US11123488B2.pdf	'2026-07-15T01:55:00.174601Z
+6a56e8740002aa0731c4d9ee		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US11084861B2.pdf	'2026-07-15T01:55:00.174599Z
+6a56e8740002aa049ab35c9d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US11071831B2.pdf	'2026-07-15T01:55:00.174596Z
+6a56e8740002aa018e6752ba		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US10858356B2.pdf	'2026-07-15T01:55:00.174593Z
+6a56e8740002a9fe2f53652c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US10828423B2.pdf	'2026-07-15T01:55:00.174590Z
+6a56e8740002a9fb3be1c5a1		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US10363377B2.pdf	'2026-07-15T01:55:00.174587Z
+6a56e8740002a9d8570e7317		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ US10118001B2.pdf	'2026-07-15T01:55:00.174552Z
+6a56e8740002a9d5100568a7		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ TWI753946B.pdf	'2026-07-15T01:55:00.174549Z
+6a56e8740002a9d34c400c1c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ MX_2024013839_A.pdf	'2026-07-15T01:55:00.174547Z
+6a56e8740002a9ce7ea658ee		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ MX_2024013837_A.pdf	'2026-07-15T01:55:00.174542Z
+6a56e8740002a9cbaa045027		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ MX2024013839.pdf	'2026-07-15T01:55:00.174539Z
+6a56e8740002a9c9e5df8156		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ MX2024013837.pdf	'2026-07-15T01:55:00.174537Z
+6a56e8740002a9c68f061a85		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ KR102223227B1.pdf	'2026-07-15T01:55:00.174534Z
+6a56e8740002a9c3c41c4516		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ JP_7767651_B2.pdf	'2026-07-15T01:55:00.174531Z
+6a56e8740002a9c0dbc1818a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ JP_2025516547_A.pdf	'2026-07-15T01:55:00.174528Z
+6a56e8740002a9bd569dd3dc		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ JP7767651.pdf	'2026-07-15T01:55:00.174525Z
+6a56e8740002a9bb68a872f0		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ JP7602573B2.pdf	'2026-07-15T01:55:00.174523Z
+6a56e8740002a9b85dca5580		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ JP7461104B2.pdf	'2026-07-15T01:55:00.174520Z
+6a56e8740002a9b5e14b8961		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ JP7280929B2.pdf	'2026-07-15T01:55:00.174517Z
+6a56e8740002a9b2ed919901		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ JP6957564B2.pdf	'2026-07-15T01:55:00.174514Z
+6a56e8740002a9afa5e9133c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ JP6567778B2.pdf	'2026-07-15T01:55:00.174511Z
+6a56e8740002a9a251d68c0e		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ JP2024566206.pdf	'2026-07-15T01:55:00.174498Z
+6a56e8740002a99f2bb1bd77		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ JP2019099571A5.pdf	'2026-07-15T01:55:00.174495Z
+6a56e8740002a99ce02524fd		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ JP2019099571A.pdf	'2026-07-15T01:55:00.174492Z
+6a56e8740002a9998b44a1eb		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ JO_P20190060_A1.pdf	'2026-07-15T01:55:00.174489Z
+6a56e8740002a997d8b8792a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ EP4638421.pdf	'2026-07-15T01:55:00.174487Z
+6a56e8740002a995f148bc8e		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ EP4633632A1.pdf	'2026-07-15T01:55:00.174485Z
+6a56e8740002a99221e0436f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ EP4633632.pdf	'2026-07-15T01:55:00.174482Z
+6a56e8740002a9878c9f5f36		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ EP4522131A1.pdf	'2026-07-15T01:55:00.174471Z
+6a56e8740002a985c36bfcfd		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ EP4522131.pdf	'2026-07-15T01:55:00.174469Z
+6a56e8740002a9825aa15dfa		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ EP4522129.pdf	'2026-07-15T01:55:00.174466Z
+6a56e8740002a980a6c212b0		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ EP4374894A3.pdf	'2026-07-15T01:55:00.174464Z
+6a56e8740002a97de44698cb		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ EP4349840A3.pdf	'2026-07-15T01:55:00.174461Z
+6a56e8740002a9799064bb9f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ EP4349840A2.pdf	'2026-07-15T01:55:00.174457Z
+6a56e8740002a976a522f349		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ EP4252803A3.pdf	'2026-07-15T01:55:00.174454Z
+6a56e8740002a9731ad0d3f2		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ EP4134367A1.pdf	'2026-07-15T01:55:00.174451Z
+6a56e8740002a96f238225dd		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ EP3517538B1.pdf	'2026-07-15T01:55:00.174447Z
+6a56e8740002a96ce55f6c9c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ EP3226944B2.pdf	'2026-07-15T01:55:00.174444Z
+6a56e8740002a94aa9a9518d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ EP0745369A2.pdf	'2026-07-15T01:55:00.174410Z
+6a56e8740002a947d799714f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ EA044109B1.pdf	'2026-07-15T01:55:00.174407Z
+6a56e8740002a944ab7e14f8		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ EA037989B1.pdf	'2026-07-15T01:55:00.174404Z
+6a56e8740002a94129d60d64		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ CN119497611A.pdf	'2026-07-15T01:55:00.174401Z
+6a56e8740002a93e9ffabb30		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ CN119173255A.pdf	'2026-07-15T01:55:00.174398Z
+6a56e8740002a93cfe4e1899		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ CN117777111A.pdf	'2026-07-15T01:55:00.174396Z
+6a56e8740002a939a0837935		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ CN109790161B.pdf	'2026-07-15T01:55:00.174393Z
+6a56e8740002a936160d40c5		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ CA3038479C.pdf	'2026-07-15T01:55:00.174390Z
+6a56e8740002a933a6eb9bff		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ AU_2026202208_A1.pdf	'2026-07-15T01:55:00.174387Z
+6a56e8740002a931d679fd4c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ AU_2026202206_A1.pdf	'2026-07-15T01:55:00.174385Z
+6a56e8740002a92d6140a035		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ AU_2023408186_A1.pdf	'2026-07-15T01:55:00.174381Z
+6a56e8740002a92949ede087		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ AU2026202208.pdf	'2026-07-15T01:55:00.174377Z
+6a56e8740002a924efb96fa0		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ AU2026202206.pdf	'2026-07-15T01:55:00.174372Z
+6a56e8740002a920d8071bd5		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ AU2024201884A1.pdf	'2026-07-15T01:55:00.174368Z
+6a56e8740002a91b06ffbfca		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ AU2024201884.pdf	'2026-07-15T01:55:00.174363Z
+6a56e8740002a9172a3965ca		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ AU2023408186.pdf	'2026-07-15T01:55:00.174359Z
+6a56e8740002a9136580e528		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ AU2023397781A1.pdf	'2026-07-15T01:55:00.174355Z
+6a56e8740002a90edbd1ce89		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ AU2023269995A1.pdf	'2026-07-15T01:55:00.174350Z
+6a56e8740002a90aba2f6536		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ AU2023269191A1.pdf	'2026-07-15T01:55:00.174346Z
+6a56e8740002a905c14c4317		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ AU2022205222B2.pdf	'2026-07-15T01:55:00.174341Z
+6a56e8740002a901c6ef7b60		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ AU2020223687B2.pdf	'2026-07-15T01:55:00.174337Z
+6a56e8740002a8fcdd0fd7f5		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ AU2020223687A1.pdf	'2026-07-15T01:55:00.174332Z
+6a56e8740002a8ef92b619f8		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    â€¢ AU2017330733B2.pdf	'2026-07-15T01:55:00.174319Z
+6a56e8740002a8ec5150eab9		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  Source Files (135):	'2026-07-15T01:55:00.174316Z
+6a56e8740002a8e9cfdac465		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  WO_2007002052_A2     WO    NON-BLOCKING    N/A                  2006-06-19   2007-01-04  	'2026-07-15T01:55:00.174313Z
+6a56e8740002a8e6bd09a687		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  JP2019099571A5       JP    NON-BLOCKING    N/A                  ?            ?           	'2026-07-15T01:55:00.174310Z
+6a56e8740002a8e30c6ef347		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  WO_2022060817_A2     WO    ?               N/A                  ?            ?           	'2026-07-15T01:55:00.174307Z
+6a56e8740002a8e0e3d89d45		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  US7291132B2          US    ?               N/A                  ?            ?           	'2026-07-15T01:55:00.174304Z
+6a56e8740002a8ddbe17f3bd		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  US5584815A           US    ?               N/A                  ?            ?           	'2026-07-15T01:55:00.174301Z
+6a56e8740002a8daf7c6f3cd		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  US18A                US    ?               N/A                  ?            ?           	'2026-07-15T01:55:00.174298Z
+6a56e8740002a8d7dae3dfba		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  US12410168           US    ?               N/A                  ?            ?           	'2026-07-15T01:55:00.174295Z
+6a56e8740002a8d222c3c611		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  WO_2018026914_A1     WO    NON-BLOCKING    N/A                  ?            ?           	'2026-07-15T01:55:00.174290Z
+6a56e8740002a8cfbe3acd2b		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  WO_2024137426_A1     WO    NON-BLOCKING    N/A                  2023-12-18   2024-06-27  	'2026-07-15T01:55:00.174287Z
+6a56e8740002a8cc10aa838d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  WO_2024129676_A1     WO    BLOCKING        Method of treatment claimed broadly 2023-12-12   2024-06-20  	'2026-07-15T01:55:00.174284Z
+6a56e8740002a8c96cfbb5a6		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  WO_2023220112_A1     WO    BLOCKING        Co-formulation/formulation 2023-05-10   2023-11-16  	'2026-07-15T01:55:00.174281Z
+6a56e8740002a8c6f67a7c3a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  WO_2023220109_A1     WO    BLOCKING        Co-formulation/formulation 2023-05-10   2023-11-16  	'2026-07-15T01:55:00.174278Z
+6a56e8740002a8c3eefef808		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  WO2025259825         WO    NON-BLOCKING    N/A                  2025-06-12   2025-12-18  	'2026-07-15T01:55:00.174275Z
+6a56e8740002a8c079a04335		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  WO2024137426A1       WO    BLOCKING        Composition of Matter 2023-12-18   2024-06-27  	'2026-07-15T01:55:00.174272Z
+6a56e8740002a8b861cd63fe		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  WO2024129676A1       WO    NON-BLOCKING    N/A                  2023-12-12   2024-06-20  	'2026-07-15T01:55:00.174264Z
+6a56e8740002a8b51dd57f21		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  WO2024050289A1       WO    NON-BLOCKING    N/A                  ?            ?           	'2026-07-15T01:55:00.174261Z
+6a56e8740002a8b300161ee3		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  WO2023220112A1       WO    BLOCKING        Co-formulation/formulation 2023-05-10   2023-11-16  	'2026-07-15T01:55:00.174259Z
+6a56e8740002a8b0770b2c2d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  WO2023220109A1       WO    BLOCKING        Co-formulation/formulation 2023-05-10   2023-11-16  	'2026-07-15T01:55:00.174256Z
+6a56e8740002a8ad4e249758		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  WO2018056453A1       WO    BLOCKING        Composition of Matter 2017-09-26   2018-03-29  	'2026-07-15T01:55:00.174253Z
+6a56e8740002a8a95e3c485a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  WO2013032779A2       WO    NON-BLOCKING    N/A                  2012-08-21   2013-03-07  	'2026-07-15T01:55:00.174249Z
+6a56e8740002a8a7ed8db8fe		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  WO2011109205A2       WO    NON-BLOCKING    N/A                  2011-02-24   2011-09-09  	'2026-07-15T01:55:00.174247Z
+6a56e8740002a8a3f2ac935d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  WO2010104779A1       WO    NON-BLOCKING    N/A                  2010-03-08   2010-09-16  	'2026-07-15T01:55:00.174243Z
+6a56e8740002a8a0cf464c7c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  WO2005097233A2       WO    NON-BLOCKING    N/A                  2005-03-25   2005-10-20  	'2026-07-15T01:55:00.174240Z
+6a56e8740002a89caac9b72f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  WO2000071191A2       WO    NON-BLOCKING    N/A                  2000-04-27   2000-11-30  	'2026-07-15T01:55:00.174236Z
+6a56e8740002a8994379f847		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US_D1092726_S        US    NON-BLOCKING    N/A                  2024-10-28   2025-09-09  	'2026-07-15T01:55:00.174233Z
+6a56e8740002a89692ead6f1		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US_2025325525_A1     US    BLOCKING        Co-formulation/formulation 2023-05-10   2025-10-23  	'2026-07-15T01:55:00.174230Z
+6a56e8740002a8935a62e781		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US_2025302809_A1     US    BLOCKING        Co-formulation/formulation 2023-05-10   2025-10-02  	'2026-07-15T01:55:00.174227Z
+6a56e8740002a890f4157178		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US_2025092041_A1     US    BLOCKING        Composition of Matter 2024-11-22   2025-03-20  	'2026-07-15T01:55:00.174224Z
+6a56e8740002a88d622adc54		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US_12410168_B2       US    BLOCKING        Co-formulation/formulation 2024-02-22   2025-09-09  	'2026-07-15T01:55:00.174221Z
+6a56e8740002a88af840c86d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US_12365682_B2       US    NON-BLOCKING    N/A                  2024-09-03   2025-07-22  	'2026-07-15T01:55:00.174218Z
+6a56e8740002a88782715599		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  USRE50455E1          US    BLOCKING        Co-formulation/formulation 2022-12-07   2025-06-10  	'2026-07-15T01:55:00.174215Z
+6a56e8740002a884da43d65e		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  USRE50455E           US    NON-BLOCKING    N/A                  2022-12-07   2025-06-10  	'2026-07-15T01:55:00.174212Z
+6a56e8740002a7476e42ebaf		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  USRE49091E           US    NON-BLOCKING    N/A                  2018-12-05   2022-06-07  	'2026-07-15T01:55:00.173895Z
+6a56e8740002a7440ec1d756		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  USRE48006E           US    NON-BLOCKING    N/A                  2018-12-20   2020-05-26  	'2026-07-15T01:55:00.173892Z
+6a56e8740002a741b730aefe		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US9925337B2          US    NON-BLOCKING    N/A                  2014-03-07   2018-03-27  	'2026-07-15T01:55:00.173889Z
+6a56e8740002a73ea5d1cc11		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US9474780B2          US    BLOCKING        Composition of Matter 2016-01-05   2016-10-25  	'2026-07-15T01:55:00.173886Z
+6a56e8740002a73b3ef20cca		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US9402957B2          US    NON-BLOCKING    N/A                  2014-04-25   2016-08-02  	'2026-07-15T01:55:00.173883Z
+6a56e8740002a73705bfb138		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US7678084B2          US    NON-BLOCKING    N/A                  2003-03-17   2010-03-16  	'2026-07-15T01:55:00.173879Z
+6a56e8740002a7356191e3b5		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US6454746B1          US    NON-BLOCKING    N/A                  1997-06-04   2002-09-24  	'2026-07-15T01:55:00.173877Z
+6a56e8740002a731b3e2467d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US6221046B1          US    NON-BLOCKING    N/A                  1996-07-09   2001-04-24  	'2026-07-15T01:55:00.173873Z
+6a56e8740002a72f250b593a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US5545147A           US    NON-BLOCKING    N/A                  1992-10-20   1996-08-13  	'2026-07-15T01:55:00.173871Z
+6a56e8740002a72bed3990d7		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US5505704A           US    NON-BLOCKING    N/A                  1995-06-01   1996-04-09  	'2026-07-15T01:55:00.173867Z
+6a56e8740002a6df1d589815		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US5383865A           US    NON-BLOCKING    N/A                  1993-03-15   1995-01-24  	'2026-07-15T01:55:00.173791Z
+6a56e8740002a6db707e307a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US5226896A           US    NON-BLOCKING    N/A                  1990-04-04   1993-07-13  	'2026-07-15T01:55:00.173787Z
+6a56e8740002a6d524044e9b		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US5226895A           US    NON-BLOCKING    N/A                  1992-10-13   1993-07-13  	'2026-07-15T01:55:00.173781Z
+6a56e8740002a6d26b8d860d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US2025302809         US    NON-BLOCKING    N/A                  2023-05-10   2025-10-02  	'2026-07-15T01:55:00.173778Z
+6a56e8740002a6c582270849		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US2025092041         US    BLOCKING        Co-formulation/formulation 2024-11-22   2025-03-20  	'2026-07-15T01:55:00.173765Z
+6a56e8740002a6c2c475c357		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US20250042899A1      US    NON-BLOCKING    N/A                  2024-09-03   2025-02-06  	'2026-07-15T01:55:00.173762Z
+6a56e8740002a6be4f0d2f0d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US20230381098A1      US    NON-BLOCKING    N/A                  2021-09-15   2023-11-30  	'2026-07-15T01:55:00.173758Z
+6a56e8740002a6ba06d20c07		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US20190225604A1      US    NON-BLOCKING    N/A                  2017-09-26   2019-07-25  	'2026-07-15T01:55:00.173754Z
+6a56e8740002a6b7186a827b		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US20190030249A1      US    NON-BLOCKING    N/A                  2017-03-10   2019-01-31  	'2026-07-15T01:55:00.173751Z
+6a56e8740002a6aee70aa42f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US20130184653A1      US    NON-BLOCKING    N/A                  2011-09-23   2013-07-18  	'2026-07-15T01:55:00.173742Z
+6a56e8740002a67f2a5f8656		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US19A                US    NON-BLOCKING    N/A                  ?            ?           	'2026-07-15T01:55:00.173695Z
+6a56e8740002a67b15255f46		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US12564687           US    NON-BLOCKING    N/A                  2021-09-01   2026-03-03  	'2026-07-15T01:55:00.173691Z
+6a56e8740002a6783af946ae		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US12558491           US    NON-BLOCKING    N/A                  2022-12-20   2026-02-24  	'2026-07-15T01:55:00.173688Z
+6a56e8740002a676ab104183		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US12505906B2         US    NON-BLOCKING    N/A                  2020-08-25   2025-12-23  	'2026-07-15T01:55:00.173686Z
+6a56e8740002a67357cc2e69		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US12505906           US    NON-BLOCKING    N/A                  2020-08-25   2025-12-23  	'2026-07-15T01:55:00.173683Z
+6a56e8740002a64af30332ec		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US12365682           US    NON-BLOCKING    N/A                  2024-09-03   2025-07-22  	'2026-07-15T01:55:00.173642Z
+6a56e8740002a647dad0ae1a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US12331050B2         US    NON-BLOCKING    N/A                  2024-08-30   2025-06-17  	'2026-07-15T01:55:00.173639Z
+6a56e8740002a644197272f1		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US12331049B2         US    NON-BLOCKING    N/A                  2024-02-22   2025-06-17  	'2026-07-15T01:55:00.173636Z
+6a56e8740002a6411ec0b322		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US12319658B2         US    NON-BLOCKING    N/A                  2020-07-31   2025-06-03  	'2026-07-15T01:55:00.173633Z
+6a56e8740002a632825f5180		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US12252524B2         US    NON-BLOCKING    N/A                  2021-07-02   2025-03-18  	'2026-07-15T01:55:00.173618Z
+6a56e8740002a62ff13851af		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US12239816B2         US    NON-BLOCKING    N/A                  ?            ?           	'2026-07-15T01:55:00.173615Z
+6a56e8740002a5d447c04d49		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US12226619B2         US    NON-BLOCKING    N/A                  2022-07-29   2025-02-18  	'2026-07-15T01:55:00.173524Z
+6a56e8740002a5d1b0839fbb		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US12187724B2         US    NON-BLOCKING    N/A                  2023-08-11   2025-01-07  	'2026-07-15T01:55:00.173521Z
+6a56e8740002a5ce45fe5801		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US12156739B2         US    NON-BLOCKING    N/A                  2022-07-14   2024-12-03  	'2026-07-15T01:55:00.173518Z
+6a56e8740002a5cb2cc665a9		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US12083324B2         US    NON-BLOCKING    N/A                  2023-04-25   2024-09-10  	'2026-07-15T01:55:00.173515Z
+6a56e8740002a5c807fced28		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US12011574B2         US    NON-BLOCKING    N/A                  2021-10-22   2024-06-18  	'2026-07-15T01:55:00.173512Z
+6a56e8740002a5c569941f44		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US11957882B2         US    NON-BLOCKING    N/A                  2018-11-30   2024-04-16  	'2026-07-15T01:55:00.173509Z
+6a56e8740002a5c2e18c6a96		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US11918792B2         US    NON-BLOCKING    N/A                  2022-12-13   2024-03-05  	'2026-07-15T01:55:00.173506Z
+6a56e8740002a5be3bd8dfea		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US11814381B2         US    NON-BLOCKING    N/A                  2020-10-07   2023-11-14  	'2026-07-15T01:55:00.173502Z
+6a56e8740002a550403dd454		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US11771837B2         US    NON-BLOCKING    N/A                  2022-08-04   2023-10-03  	'2026-07-15T01:55:00.173392Z
+6a56e8740002a54e525f7119		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US11554221B2         US    NON-BLOCKING    N/A                  2017-07-07   2023-01-17  	'2026-07-15T01:55:00.173390Z
+6a56e8740002a54b4fa67a2a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US11542313B2         US    BLOCKING        Composition of Matter 2018-12-14   2023-01-03  	'2026-07-15T01:55:00.173387Z
+6a56e8740002a537db5fd0f1		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US11179522B2         US    NON-BLOCKING    N/A                  2020-03-19   2021-11-23  	'2026-07-15T01:55:00.173367Z
+6a56e8740002a534561c7de0		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US11123488B2         US    NON-BLOCKING    N/A                  ?            ?           	'2026-07-15T01:55:00.173364Z
+6a56e8740002a530f45506a9		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US11084861B2         US    NON-BLOCKING    N/A                  2019-07-22   2021-08-10  	'2026-07-15T01:55:00.173360Z
+6a56e8740002a52e21468854		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US11071831B2         US    NON-BLOCKING    N/A                  2019-02-20   2021-07-27  	'2026-07-15T01:55:00.173358Z
+6a56e8740002a52b040450f3		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US10858356B2         US    NON-BLOCKING    N/A                  2017-09-26   2020-12-08  	'2026-07-15T01:55:00.173355Z
+6a56e8740002a52890c5d143		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US10828423B2         US    NON-BLOCKING    N/A                  2016-03-10   2020-11-10  	'2026-07-15T01:55:00.173352Z
+6a56e8740002a525ff41de41		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US10363377B2         US    NON-BLOCKING    N/A                  2015-12-01   2019-07-30  	'2026-07-15T01:55:00.173349Z
+6a56e8740002a5225fb33564		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  US10118001B2         US    NON-BLOCKING    N/A                  2015-02-06   2018-11-06  	'2026-07-15T01:55:00.173346Z
+6a56e8740002a51ec3c08900		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  TWI753946B           TW    BLOCKING        Composition of Matter ?            ?           	'2026-07-15T01:55:00.173342Z
+6a56e8740002a4f67ee8d443		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  MX_2024013839_A      MX    BLOCKING        Co-formulation/formulation 2024-11-08   2024-12-06  	'2026-07-15T01:55:00.173302Z
+6a56e8740002a4f3c599aa28		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  MX_2024013837_A      MX    BLOCKING        Co-formulation/formulation 2024-11-08   2024-12-06  	'2026-07-15T01:55:00.173299Z
+6a56e8740002a4f11e29cc92		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  MX2024013839         MX    BLOCKING        Co-formulation/formulation 2024-11-08   2024-12-06  	'2026-07-15T01:55:00.173297Z
+6a56e8740002a4eeba11813c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  MX2024013837         MX    BLOCKING        Co-formulation/formulation 2024-11-08   2024-12-06  	'2026-07-15T01:55:00.173294Z
+6a56e8740002a4eb51c37e20		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  KR102223227B1        KR    BLOCKING        Composition of Matter ?            ?           	'2026-07-15T01:55:00.173291Z
+6a56e8740002a4e8844ceee3		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  JP_7767651_B2        JP    BLOCKING        Co-formulation/formulation ?            ?           	'2026-07-15T01:55:00.173288Z
+6a56e8740002a4e5a0f21567		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  JP_2025516547_A      JP    BLOCKING        Co-formulation/formulation ?            ?           	'2026-07-15T01:55:00.173285Z
+6a56e8740002a4c745b1ac92		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  JP7767651            JP    NON-BLOCKING    N/A                  ?            ?           	'2026-07-15T01:55:00.173255Z
+6a56e8740002a4c44f4e01c6		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  JP7602573B2          JP    NON-BLOCKING    N/A                  ?            ?           	'2026-07-15T01:55:00.173252Z
+6a56e8740002a4c1b12cd78f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  JP7461104B2          JP    BLOCKING        Composition of Matter ?            ?           	'2026-07-15T01:55:00.173249Z
+6a56e8740002a4bf14884723		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  JP7280929B2          JP    BLOCKING        Co-formulation/formulation ?            ?           	'2026-07-15T01:55:00.173247Z
+6a56e8740002a4bc4a09e677		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  JP6957564B2          JP    NON-BLOCKING    N/A                  2019-07-31   2021-11-02  	'2026-07-15T01:55:00.173244Z
+6a56e8740002a4b922e0ff3e		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  JP6567778B2          JP    BLOCKING        Composition of Matter 2017-09-26   2019-08-28  	'2026-07-15T01:55:00.173241Z
+6a56e8740002a4b6e4ade7b3		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  JP2024566206         JP    BLOCKING        Co-formulation/formulation ?            ?           	'2026-07-15T01:55:00.173238Z
+6a56e8740002a4b3f92c7d18		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  JP2019099571A        JP    NON-BLOCKING    N/A                  ?            ?           	'2026-07-15T01:55:00.173235Z
+6a56e8740002a4b080fdf01e		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  JO_P20190060_A1      JO    BLOCKING        Composition of Matter ?            ?           	'2026-07-15T01:55:00.173232Z
+6a56e8740002a49632462632		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  EP4638421            EP    NON-BLOCKING    N/A                  2023-12-18   2024-06-27  	'2026-07-15T01:55:00.173206Z
+6a56e8740002a493f34acd45		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  EP4633632A1          EP    NON-BLOCKING    N/A                  2023-12-12   2024-06-20  	'2026-07-15T01:55:00.173203Z
+6a56e8740002a490b5b43703		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  EP4633632            EP    BLOCKING        Method of Treatment claimed broadly 2023-12-12   2024-06-20  	'2026-07-15T01:55:00.173200Z
+6a56e8740002a48da75f7c21		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  EP4522131A1          EP    BLOCKING        Co-formulation/formulation 2023-05-10   2023-11-16  	'2026-07-15T01:55:00.173197Z
+6a56e8740002a47d02b00131		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  EP4522131            EP    BLOCKING        Co-formulation/formulation 2023-05-10   2023-11-16  	'2026-07-15T01:55:00.173181Z
+6a56e8740002a4795004fedd		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  EP4522129            EP    NON-BLOCKING    N/A                  2023-05-10   2023-11-16  	'2026-07-15T01:55:00.173177Z
+6a56e8740002a477ebf14be5		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  EP4374894A3          EP    NON-BLOCKING    N/A                  2018-08-17   2024-05-29  	'2026-07-15T01:55:00.173175Z
+6a56e8740002a473523f1431		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  EP4349840A3          EP    NON-BLOCKING    N/A                  2017-09-26   2024-04-10  	'2026-07-15T01:55:00.173171Z
+6a56e8740002a470ccb93109		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  EP4349840A2          EP    NON-BLOCKING    N/A                  2017-09-26   2024-04-10  	'2026-07-15T01:55:00.173168Z
+6a56e8740002a46d39282e45		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  EP4252803A3          EP    NON-BLOCKING    N/A                  2018-12-06   2023-10-04  	'2026-07-15T01:55:00.173165Z
+6a56e8740002a46a7a657dae		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  EP4134367A1          EP    NON-BLOCKING    N/A                  ?            ?           	'2026-07-15T01:55:00.173162Z
+6a56e8740002a467c0db9e5b		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  EP3517538B1          EP    BLOCKING        Composition of Matter 2017-09-26   2019-09-26  	'2026-07-15T01:55:00.173159Z
+6a56e8740002a42c0f6d347f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  EP3226944B2          EP    NON-BLOCKING    N/A                  ?            ?           	'2026-07-15T01:55:00.173100Z
+6a56e8740002a41ff954768d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  EP0745369A2          EP    NON-BLOCKING    N/A                  1996-05-30   1996-12-04  	'2026-07-15T01:55:00.173087Z
+6a56e8740002a41b4b00df57		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  EA044109B1           EA    BLOCKING        Co-formulation/formulation 2017-09-26   2023-07-24  	'2026-07-15T01:55:00.173083Z
+6a56e8740002a40595c9ba3b		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  EA037989B1           EA    BLOCKING        Composition of Matter 2017-09-26   2021-06-21  	'2026-07-15T01:55:00.173061Z
+6a56e8740002a402b6396375		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  CN119497611A         CN    BLOCKING        Co-formulation/formulation 2023-05-10   2025-02-21  	'2026-07-15T01:55:00.173058Z
+6a56e8740002a3ff1c491888		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  CN119173255A         CN    BLOCKING        Co-formulation/formulation 2023-05-10   2024-12-20  	'2026-07-15T01:55:00.173055Z
+6a56e8740002a3fbdf17fb30		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  CN117777111A         CN    NON-BLOCKING    N/A                  2023-12-26   2024-03-29  	'2026-07-15T01:55:00.173051Z
+6a56e8740002a3f7bd732cb6		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  CN109790161B         CN    BLOCKING        Composition of Matter 2017-09-26   2022-03-11  	'2026-07-15T01:55:00.173047Z
+6a56e8740002a3f222c54639		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  CA3038479C           CA    BLOCKING        Composition of Matter ?            ?           	'2026-07-15T01:55:00.173042Z
+6a56e8740002a3efefd3cdc0		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  AU_2026202208_A1     AU    NON-BLOCKING    N/A                  2026-03-20   2026-04-09  	'2026-07-15T01:55:00.173039Z
+6a56e8740002a3ecec8cefab		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  AU_2026202206_A1     AU    BLOCKING        Co-formulation/formulation 2026-03-20   2026-04-09  	'2026-07-15T01:55:00.173036Z
+6a56e8740002a3e9028ef60b		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  AU_2023408186_A1     AU    NON-BLOCKING    N/A                  2023-12-18   2024-06-27  	'2026-07-15T01:55:00.173033Z
+6a56e8740002a3e69f0e4328		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  AU2026202208         AU    NON-BLOCKING    N/A                  ?            ?           	'2026-07-15T01:55:00.173030Z
+6a56e8740002a3e3a7e4c3cb		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  AU2026202206         AU    NON-BLOCKING    N/A                  2026-03-20   2026-04-09  	'2026-07-15T01:55:00.173027Z
+6a56e8740002a3e016196c8f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  AU2024201884A1       AU    NON-BLOCKING    N/A                  2024-03-22   2024-04-11  	'2026-07-15T01:55:00.173024Z
+6a56e8740002a3bd6c805c13		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  AU2024201884         AU    NON-BLOCKING    N/A                  ?            ?           	'2026-07-15T01:55:00.172989Z
+6a56e8740002a3bb5721c4f5		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  AU2023408186         AU    NON-BLOCKING    N/A                  2023-12-18   2024-06-27  	'2026-07-15T01:55:00.172987Z
+6a56e8740002a3b87634c494		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  AU2023397781A1       AU    BLOCKING        Method of treatment claimed broadly 2023-12-12   2024-06-20  	'2026-07-15T01:55:00.172984Z
+6a56e8740002a3b504f18ddf		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  AU2023269995A1       AU    BLOCKING        Co-formulation/formulation 2023-05-10   2023-11-16  	'2026-07-15T01:55:00.172981Z
+6a56e8740002a3b244f081a0		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  AU2023269191A1       AU    BLOCKING        Co-formulation/formulation 2023-05-10   2023-11-16  	'2026-07-15T01:55:00.172978Z
+6a56e8740002a3af2ad00d16		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  AU2022205222B2       AU    NON-BLOCKING    N/A                  2022-07-13   2022-08-04  	'2026-07-15T01:55:00.172975Z
+6a56e8740002a3ac8fc025c9		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  AU2020223687B2       AU    BLOCKING        Composition of Matter 2020-08-26   2020-09-10  	'2026-07-15T01:55:00.172972Z
+6a56e8740002a3a8b8a97042		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  AU2020223687A1       AU    NON-BLOCKING    N/A                  2020-08-26   2020-09-10  	'2026-07-15T01:55:00.172968Z
+6a56e8740002a3a4eba0c7d1		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  AU2017330733B2       AU    BLOCKING        Composition of Matter 2017-09-26   2018-03-29  	'2026-07-15T01:55:00.172964Z
+6a56e8740002a3a0e359b5c3		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  ------------------------------------------------------------------------------------	'2026-07-15T01:55:00.172960Z
+6a56e8740002a39d9a015dc7		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  Patent               Jur   Tag             Category             Filed        Granted     	'2026-07-15T01:55:00.172957Z
+6a56e8740002a399c849b72a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  Patents       : 135	'2026-07-15T01:55:00.172953Z
+6a56e8740002a396d3145ab3		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  Time          : 57.7s	'2026-07-15T01:55:00.172950Z
+6a56e8740002a3920bd2a97d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  From Cache    : True	'2026-07-15T01:55:00.172946Z
+6a56e8740002a338eea97775		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  Phase Source  : cached	'2026-07-15T01:55:00.172856Z
+6a56e8740002a33582314caa		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  Analysis Date : 2026-07-15	'2026-07-15T01:55:00.172853Z
+6a56e8740002a3323f8ac5d6		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'============================================================	'2026-07-15T01:55:00.172850Z
+6a56e8740002a32e59d67637		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  RESULT: Orforglipron Calcium	'2026-07-15T01:55:00.172846Z
+6a56e8740002a32a75ae1cce		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'============================================================	'2026-07-15T01:55:00.172842Z
+6a56e8740002a3246ab1f350		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[PIPELINE] Using cached results â€” 135 patent(s) in 57.7s	'2026-07-15T01:55:00.172836Z
+6a56e87400029c77ee8bc5d2		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:55:00.499476523Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[COMBINED EXCEL] âœ“ Saved: gs://cognito-gcs/pipeline_cache/patent_exports/combined_20260715.xlsx (2638 total rows)	'2026-07-15T01:55:00.171127Z
+6a56e86f00034f84bc3948af		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:55.498297450Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[COMBINED EXCEL] + Vk-2735_20260715.xlsx (59 rows)	'2026-07-15T01:54:55.216964Z
+6a56e86d00072006da2d9355		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:53.500120599Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[COMBINED EXCEL] + Tirzepatide_20260715.xlsx (604 rows)	'2026-07-15T01:54:53.466950Z
+6a56e86a00050099b2ccc03f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:50.505336647Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[COMBINED EXCEL] + Survodutide_20260715.xlsx (144 rows)	'2026-07-15T01:54:50.327833Z
+6a56e8680003ccb02bfb2bd8		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:48.504291157Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[COMBINED EXCEL] + Semaglutide_20260715.xlsx (858 rows)	'2026-07-15T01:54:48.249008Z
+6a56e8640009b228d9fc2b10		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:44.840402432Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[COMBINED EXCEL] + Retatrutide_20260715.xlsx (131 rows)	'2026-07-15T01:54:44.635432Z
+6a56e862000824a33969f175		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:42.848442906Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[COMBINED EXCEL] + Orforglipron_Calcium_20260715.xlsx (135 rows)	'2026-07-15T01:54:42.533667Z
+6a56e860000a849b87d58d11		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:40.858610826Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[COMBINED EXCEL] + Mazdutide_20260715.xlsx (137 rows)	'2026-07-15T01:54:40.689307Z
+6a56e85e000937a6dc45e479		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:38.854703485Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[COMBINED EXCEL] + Cagrilintide+Semaglutide_20260715.xlsx (523 rows)	'2026-07-15T01:54:38.604070Z
+6a56e85b0007332ee67d46f9		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:35.520948191Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[COMBINED EXCEL] + Bofanglutide_20260715.xlsx (40 rows)	'2026-07-15T01:54:35.471854Z
+6a56e859000b820e57aae02b		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:33.855202425Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[COMBINED EXCEL] + Bgm-0504_20260715.xlsx (7 rows)	'2026-07-15T01:54:33.754190Z
+6a56e85800013ccf015c3720		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:32.188924822Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[COMBINED EXCEL] Combining 10 file(s)...	'2026-07-15T01:54:32.081103Z
+6a56e8550002f87ff4011ddf		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:29.524487973Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[EXCEL] âœ“ Exported: gs://cognito-gcs/pipeline_cache/patent_exports/Orforglipron_Calcium_20260715.xlsx	'2026-07-15T01:54:29.194687Z
+6a56e85300069d64b750dec0		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[EXCEL] Writing to GCS: patent_exports/Orforglipron Calcium_20260715.xlsx	'2026-07-15T01:54:27.433508Z
+6a56e85300063631ce6f81c5		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[IP DIM 1] avg_years_to_entry_us_ep: 17.5 â†’ IP Dimension 1 Score: 1	'2026-07-15T01:54:27.407089Z
+6a56e8530006362ee5902d61		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[IP DIM 1] EP years_to_entry: 17 (from EP4522131)	'2026-07-15T01:54:27.407086Z
+6a56e8530006362a91bdfb17		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[IP DIM 1] US years_to_entry: 18 (from US2025092041)	'2026-07-15T01:54:27.407082Z
+6a56e853000635fedbc1547c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[IP DIM 1] Calculating US+EP avg years to entry and IP Dimension 1 Score...	'2026-07-15T01:54:27.407038Z
+6a56e853000635fb85a8369c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[SCORE] avg_years_to_entry: 16.12 â†’ Score: 1	'2026-07-15T01:54:27.407035Z
+6a56e853000635f7ef3d6420		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[SCORE] WO years_to_entry: 17 (from WO2023220109A1)	'2026-07-15T01:54:27.407031Z
+6a56e853000635a787d447f3		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[SCORE] US years_to_entry: 18 (from US2025092041)	'2026-07-15T01:54:27.406951Z
+6a56e8530006357f1771cba5		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[SCORE] TW years_to_entry: not available	'2026-07-15T01:54:27.406911Z
+6a56e85300063555512dc138		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[SCORE] MX years_to_entry: 18 (from MX2024013837)	'2026-07-15T01:54:27.406869Z
+6a56e853000635511004838c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[SCORE] KR years_to_entry: not available	'2026-07-15T01:54:27.406865Z
+6a56e8530006354e733dd287		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[SCORE] JP years_to_entry: 11 (from JP6567778B2)	'2026-07-15T01:54:27.406862Z
+6a56e8530006354bf5ef07b3		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[SCORE] JO years_to_entry: not available	'2026-07-15T01:54:27.406859Z
+6a56e8530006350de90c2c3b		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[SCORE] EP years_to_entry: 17 (from EP4522131)	'2026-07-15T01:54:27.406797Z
+6a56e8530006350ad94f4769		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[SCORE] EA years_to_entry: 11 (from EA037989B1)	'2026-07-15T01:54:27.406794Z
+6a56e85300063507eb24edc6		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[SCORE] CN years_to_entry: 17 (from CN119173255A)	'2026-07-15T01:54:27.406791Z
+6a56e85300063504b8713cd3		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[SCORE] CA years_to_entry: not available	'2026-07-15T01:54:27.406788Z
+6a56e853000634a82f8cd4b4		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[SCORE] AU years_to_entry: 20 (from AU_2026202206_A1)	'2026-07-15T01:54:27.406696Z
+6a56e853000634501a98d3f4		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[SCORE] Calculating avg years to entry and score...	'2026-07-15T01:54:27.406608Z
+6a56e8530006342e7970a711		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[PEDIATRIC] Applying pediatric exclusivity adjustments...	'2026-07-15T01:54:27.406574Z
+6a56e8530006342bcbbc7bfb		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[YEARS TO ENTRY] WO2023220109A1 | max(2043, 2037) - 2026 = 17	'2026-07-15T01:54:27.406571Z
+6a56e853000633fbc936de1c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[YEARS TO ENTRY] US2025092041 | max(2044, 2034) - 2026 = 18	'2026-07-15T01:54:27.406523Z
+6a56e853000633f776c16355		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[YEARS TO ENTRY] MX2024013837 | max(2044, 2037) - 2026 = 18	'2026-07-15T01:54:27.406519Z
+6a56e853000633f45216aeb4		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[YEARS TO ENTRY] JP6567778B2 | max(2037, 2037) - 2026 = 11	'2026-07-15T01:54:27.406516Z
+6a56e853000633f11f2a17b3		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[YEARS TO ENTRY] EP4522131 | max(2043, 2039) - 2026 = 17	'2026-07-15T01:54:27.406513Z
+6a56e853000633eeb85f27dc		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[YEARS TO ENTRY] EA037989B1 | max(2037, 2037) - 2026 = 11	'2026-07-15T01:54:27.406510Z
+6a56e853000633ebcd831299		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[YEARS TO ENTRY] CN119173255A | max(2043, 2037) - 2026 = 17	'2026-07-15T01:54:27.406507Z
+6a56e853000633e27a8c3d73		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[YEARS TO ENTRY] AU_2026202206_A1 | max(2046, 2037) - 2026 = 20	'2026-07-15T01:54:27.406498Z
+6a56e853000633a0d8112a18		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[YEARS TO ENTRY] Calculating years to entry...	'2026-07-15T01:54:27.406432Z
+6a56e8530006339d80b2831e		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[CONTROLLING EXPIRY] WO2023220109A1 | WO | Filed: 2023-05-10 | Effective year: 2023.00 + 20 â†’ 2043	'2026-07-15T01:54:27.406429Z
+6a56e853000633446502b774		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[CONTROLLING EXPIRY] US2025092041 | US | Filed: 2024-11-22 | Effective year: 2024.00 + 20 â†’ 2044	'2026-07-15T01:54:27.406340Z
+6a56e85300063304486353a0		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[CONTROLLING EXPIRY] No BLOCKING TW patents with filing dates.	'2026-07-15T01:54:27.406276Z
+6a56e853000632e10e67c942		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[CONTROLLING EXPIRY] MX2024013837 | MX | Filed: 2024-11-08 | Effective year: 2024.00 + 20 â†’ 2044	'2026-07-15T01:54:27.406241Z
+6a56e853000632ad492e24a7		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[CONTROLLING EXPIRY] No BLOCKING KR patents with filing dates.	'2026-07-15T01:54:27.406189Z
+6a56e8530006328db69a6866		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[CONTROLLING EXPIRY] JP6567778B2 | JP | Filed: 2017-09-26 | Effective year: 2017.00 + 20 â†’ 2037	'2026-07-15T01:54:27.406157Z
+6a56e85300063266a36f99e9		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[CONTROLLING EXPIRY] No BLOCKING JO patents with filing dates.	'2026-07-15T01:54:27.406118Z
+6a56e85300063234152f3160		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[CONTROLLING EXPIRY] EP4522131 | EP | Filed: 2023-05-10 | Effective year: 2023.00 + 20 â†’ 2043	'2026-07-15T01:54:27.406068Z
+6a56e853000632303d9e0e79		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[CONTROLLING EXPIRY] EA037989B1 | EA | Filed: 2017-09-26 | Effective year: 2017.00 + 20 â†’ 2037	'2026-07-15T01:54:27.406064Z
+6a56e853000631fb03817312		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[CONTROLLING EXPIRY] CN119173255A | CN | Filed: 2023-05-10 | Effective year: 2023.00 + 20 â†’ 2043	'2026-07-15T01:54:27.406011Z
+6a56e853000631c9464d4a78		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[CONTROLLING EXPIRY] No BLOCKING CA patents with filing dates.	'2026-07-15T01:54:27.405961Z
+6a56e85300063192371d190e		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[CONTROLLING EXPIRY] AU_2026202206_A1 | AU | Filed: 2026-03-20 | Effective year: 2026.00 + 20 â†’ 2046	'2026-07-15T01:54:27.405906Z
+6a56e8530006312236df83d9		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[CONTROLLING EXPIRY] Calculating controlling patent expiry year...	'2026-07-15T01:54:27.405794Z
+6a56e8530006311e1d2ecdb2		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[EXCLUSIVITY] WO2023220109A1 | WO | 2029 + 8 â†’ 2037	'2026-07-15T01:54:27.405790Z
+6a56e853000631196213c71d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[EXCLUSIVITY] WO2023220109A1 | WO | Using estimated approval year: 2029	'2026-07-15T01:54:27.405785Z
+6a56e853000630dffa43147a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[EXCLUSIVITY] US2025092041 | US | 2029 + 5 â†’ 2034	'2026-07-15T01:54:27.405727Z
+6a56e853000630dbf7ea5a5c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[EXCLUSIVITY] US2025092041 | US | Using estimated approval year: 2029	'2026-07-15T01:54:27.405723Z
+6a56e853000630b2eb877bc3		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[EXCLUSIVITY] No BLOCKING TW patents with filing dates.	'2026-07-15T01:54:27.405682Z
+6a56e8530006309a9e38d3f3		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[EXCLUSIVITY] MX2024013837 | MX | 2029 + 8 â†’ 2037	'2026-07-15T01:54:27.405658Z
+6a56e85300063095652d8b6a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[EXCLUSIVITY] MX2024013837 | MX | Using estimated approval year: 2029	'2026-07-15T01:54:27.405653Z
+6a56e85300063091db90c9a8		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[EXCLUSIVITY] No BLOCKING KR patents with filing dates.	'2026-07-15T01:54:27.405649Z
+6a56e8530006304622a49c9f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[EXCLUSIVITY] JP6567778B2 | JP | 2029 + 8 â†’ 2037	'2026-07-15T01:54:27.405574Z
+6a56e85300063044d872ab9f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[EXCLUSIVITY] JP6567778B2 | JP | Using estimated approval year: 2029	'2026-07-15T01:54:27.405572Z
+6a56e8530006303f6349e1bc		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[EXCLUSIVITY] No BLOCKING JO patents with filing dates.	'2026-07-15T01:54:27.405567Z
+6a56e8530006300cc5c0fb2a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[EXCLUSIVITY] EP4522131 | EP | 2029 + 10 â†’ 2039	'2026-07-15T01:54:27.405516Z
+6a56e85300063009cde99d88		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[EXCLUSIVITY] EP4522131 | EP | Using estimated approval year: 2029	'2026-07-15T01:54:27.405513Z
+6a56e85300062fefb576ce94		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[EXCLUSIVITY] EA037989B1 | EA | 2029 + 8 â†’ 2037	'2026-07-15T01:54:27.405487Z
+6a56e85300062fea5b275f1a		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[EXCLUSIVITY] EA037989B1 | EA | Using estimated approval year: 2029	'2026-07-15T01:54:27.405482Z
+6a56e85300062fa010f01f6d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[EXCLUSIVITY] CN119173255A | CN | 2029 + 8 â†’ 2037	'2026-07-15T01:54:27.405408Z
+6a56e85300062f9b4eb2d02e		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[EXCLUSIVITY] CN119173255A | CN | Using estimated approval year: 2029	'2026-07-15T01:54:27.405403Z
+6a56e85300062f6e0a0de2e0		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[EXCLUSIVITY] No BLOCKING CA patents with filing dates.	'2026-07-15T01:54:27.405358Z
+6a56e85300062f537e3578bf		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[EXCLUSIVITY] AU_2026202206_A1 | AU | 2029 + 8 â†’ 2037	'2026-07-15T01:54:27.405331Z
+6a56e85300062f4d2a8d5c87		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[EXCLUSIVITY] AU_2026202206_A1 | AU | Using estimated approval year: 2029	'2026-07-15T01:54:27.405325Z
+6a56e85300062eca0713f2f1		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[EXCLUSIVITY] Calculating exclusivity year...	'2026-07-15T01:54:27.405194Z
+6a56e85300062ebcb69e93c7		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[APPROVAL YEAR] WO2023220109A1 | WO | Filed: 2023-05-10 | Phase: Phase 3 | 2026 + 3 â†’ 2029	'2026-07-15T01:54:27.405180Z
+6a56e85300062e9fe962f6fe		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[APPROVAL YEAR] US2025092041 | US | Filed: 2024-11-22 | Phase: Phase 3 | 2026 + 3 â†’ 2029	'2026-07-15T01:54:27.405151Z
+6a56e85300062e9977f6e58d		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[APPROVAL YEAR] No BLOCKING TW patents with filing dates.	'2026-07-15T01:54:27.405145Z
+6a56e85300062e5d1e89490c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[APPROVAL YEAR] MX2024013837 | MX | Filed: 2024-11-08 | Phase: Phase 3 | 2026 + 3 â†’ 2029	'2026-07-15T01:54:27.405085Z
+6a56e85300062e09905b87b5		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[APPROVAL YEAR] No BLOCKING KR patents with filing dates.	'2026-07-15T01:54:27.405001Z
+6a56e85300062e05d120496c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[APPROVAL YEAR] JP6567778B2 | JP | Filed: 2017-09-26 | Phase: Phase 3 | 2026 + 3 â†’ 2029	'2026-07-15T01:54:27.404997Z
+6a56e85300062e00d233b3df		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[APPROVAL YEAR] No BLOCKING JO patents with filing dates.	'2026-07-15T01:54:27.404992Z
+6a56e85300062da6b2e92a11		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[APPROVAL YEAR] EP4522131 | EP | Filed: 2023-05-10 | Phase: Phase 3 | 2026 + 3 â†’ 2029	'2026-07-15T01:54:27.404902Z
+6a56e85300062d9195e0f4f1		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[APPROVAL YEAR] EA037989B1 | EA | Filed: 2017-09-26 | Phase: Phase 3 | 2026 + 3 â†’ 2029	'2026-07-15T01:54:27.404881Z
+6a56e85300062d8c0f78c984		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[APPROVAL YEAR] CN119173255A | CN | Filed: 2023-05-10 | Phase: Phase 3 | 2026 + 3 â†’ 2029	'2026-07-15T01:54:27.404876Z
+6a56e85300062d3d6d4dd74c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[APPROVAL YEAR] No BLOCKING CA patents with filing dates.	'2026-07-15T01:54:27.404797Z
+6a56e85300062d2af9f839d7		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[APPROVAL YEAR] AU_2026202206_A1 | AU | Filed: 2026-03-20 | Phase: Phase 3 | 2026 + 3 â†’ 2029	'2026-07-15T01:54:27.404778Z
+6a56e85300062d2582e8f222		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[APPROVAL YEAR] Calculating estimated approval year...	'2026-07-15T01:54:27.404773Z
+6a56e85300062d162326febb		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:27.532576373Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[RESULTS CACHE] Full cache hit for 'Orforglipron Calcium' (135 patent(s), analysed: 2026-06-25)	'2026-07-15T01:54:27.404758Z
+6a56e85000033956b77fee3f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:24.533094341Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[STEP 1] 135 PDF(s) found	'2026-07-15T01:54:24.211286Z
+6a56e8500003394e72f48b9f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:24.533094341Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[GCS] Found 135 PDF(s): ['AU2017330733B2.pdf', 'AU2020223687A1.pdf', 'AU2020223687B2.pdf', 'AU2022205222B2.pdf', 'AU2023269191A1.pdf', 'AU2023269995A1.pdf', 'AU2023397781A1.pdf', 'AU2023408186.pdf', 'AU2024201884.pdf', 'AU2024201884A1.pdf', 'AU2026202206.pdf', 'AU2026202208.pdf', 'AU_2023408186_A1.pdf', 'AU_2026202206_A1.pdf', 'AU_2026202208_A1.pdf', 'CA3038479C.pdf', 'CN109790161B.pdf', 'CN117777111A.pdf', 'CN119173255A.pdf', 'CN119497611A.pdf', 'EA037989B1.pdf', 'EA044109B1.pdf', 'EP0745369A2.pdf', 'EP3226944B2.pdf', 'EP3517538B1.pdf', 'EP4134367A1.pdf', 'EP4252803A3.pdf', 'EP4349840A2.pdf', 'EP4349840A3.pdf', 'EP4374894A3.pdf', 'EP4522129.pdf', 'EP4522131.pdf', 'EP4522131A1.pdf', 'EP4633632.pdf', 'EP4633632A1.pdf', 'EP4638421.pdf', 'JO_P20190060_A1.pdf', 'JP2019099571A.pdf', 'JP2019099571A5.pdf', 'JP2024566206.pdf', 'JP6567778B2.pdf', 'JP6957564B2.pdf', 'JP7280929B2.pdf', 'JP7461104B2.pdf', 'JP7602573B2.pdf', 'JP7767651.pdf', 'JP_2025516547_A.pdf', 'JP_7767651_B2.pdf', 'KR102223227B1.pdf', 'MX2024013837.pdf', 'MX2024013839.pdf', 'MX_2024013837_A.pdf', 'MX_2024013839_A.pdf', 'TWI753946B.pdf', 'US10118001B2.pdf', 'US10363377B2.pdf', 'US10828423B2.pdf', 'US10858356B2.pdf', 'US11071831B2.pdf', 'US11084861B2.pdf', 'US11123488B2.pdf', 'US11179522B2.pdf', 'US11542313B2.pdf', 'US11554221B2.pdf', 'US11771837B2.pdf', 'US11814381B2.pdf', 'US11918792B2.pdf', 'US11957882B2.pdf', 'US12011574B2.pdf', 'US12083324B2.pdf', 'US12156739B2.pdf', 'US12187724B2.pdf', 'US12226619B2.pdf', 'US12239816B2.pdf', 'US12252524B2.pdf', 'US12319658B2.pdf', 'US12331049B2.pdf', 'US12331050B2.pdf', 'US12365682.pdf', 'US12410168.pdf', 'US12505906.pdf', 'US12505906B2.pdf', 'US12558491.pdf', 'US12564687.pdf', 'US18A.pdf', 'US19A.pdf', 'US20130184653A1.pdf', 'US20190030249A1.pdf', 'US20190225604A1.pdf', 'US20230381098A1.pdf', 'US20250042899A1.pdf', 'US2025092041.pdf', 'US2025302809.pdf', 'US5226895A.pdf', 'US5226896A.pdf', 'US5383865A.pdf', 'US5505704A.pdf', 'US5545147A.pdf', 'US5584815A.pdf', 'US6221046B1.pdf', 'US6454746B1.pdf', 'US7291132B2.pdf', 'US7678084B2.pdf', 'US9402957B2.pdf', 'US9474780B2.pdf', 'US9925337B2.pdf', 'USRE48006E1.pdf', 'USRE49091E1.pdf', 'USRE50455E.pdf', 'USRE50455E1.pdf', 'US_12365682_B2.pdf', 'US_12410168_B2.pdf', 'US_2025092041_A1.pdf', 'US_2025302809_A1.pdf', 'US_2025325525_A1.pdf', 'US_D1092726_S.pdf', 'WO2000071191A2.pdf', 'WO2005097233A2.pdf', 'WO2010104779A1.pdf', 'WO2011109205A2.pdf', 'WO2013032779A2.pdf', 'WO2018056453A1.pdf', 'WO2023220109A1.pdf', 'WO2023220112A1.pdf', 'WO2024050289A1.pdf', 'WO2024129676A1.pdf', 'WO2024137426A1.pdf', 'WO2025259825.pdf', 'WO_2007002052_A2.pdf', 'WO_2022060817_A2.pdf', 'WO_2023220109_A1.pdf', 'WO_2023220112_A1.pdf', 'WO_2024129676_A1.pdf', 'WO_2024137426_A1.pdf', 'WO_2018026914_A1.pdf']	'2026-07-15T01:54:24.211278Z
+6a56e850000317d4d4323365		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:24.533094341Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[GCS] Matched folder prefix: Cognito_new/Master_patent_list/Orforglipron Calcium/	'2026-07-15T01:54:24.202708Z
+6a56e850000317cad7b890fd		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:24.533094341Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[GCS] Drug folders found: ['acmopatide', 'afamitresgeneautoleucel', 'albenatide', 'albiglutide', 'aleniglipronlarginine', 'asc30', 'azd6234+azd9550', 'azd9550', 'bgm0504', 'belantamabmafodotin', 'benaglutide', 'berobenatide', 'bofanglutide', 'bortezomib', 'brenipatide', 'buntanetaptartrate+dulaglutide+sildenafilcitrate', 'buntanetaptartrate+dulaglutide', 'cabazitaxel', 'cagrilintide+semaglutide', 'cotadutide', 'ct388', 'ct868', 'ct996', 'cyclophosphamide', 'da302168s', 'dapiglutide', 'dd01', 'dexamethasone', 'docetaxel', 'dulaglutide', 'ecnoglutide', 'efinopegdutide', 'efocipegtrutide', 'efpeglenatide', 'elecoglipron', 'elranatamab', 'enicepatide', 'exenatide', 'futibatinib', 'gallium(86ga)gozetotide', 'gemcitabinecontrolledrelease', 'gemcitabine', 'glasdegib', 'glofitamab', 'gsbr1290', 'hdm1002', 'hdm1005', 'hm15275', 'hrs7535', 'hs10501', 'hs20004', 'hyaluronidase', 'imatinib', 'insulindegludec+liraglutide', 'insulinicodec+semaglutide', 'ixekizumab+tirzepatide', 'linvoseltamab', 'liraglutidebiobetter', 'liraglutide', 'lixisenatide', 'lotiglipron', 'mazdutide', 'met097i+met233i', 'met224o', 'mirdametinib', 'mirikizumab+tirzepatide', 'mosunetuzumab', 'mrank001', 'mwn109', 'na931', 'naperiglipronerbumine', 'nilotinib', 'nn9490', 'obecabtageneautoleucel', 'olatorepatide', 'orforgliproncalcium', 'paclitaxel', 'pb119', 'pb718', 'pegapamodutide', 'pegloxenatide', 'pegsebrenatide', 'pemvidutide', 'penpulimab', 'pf08653944', 'ray1225', 'repotrectinib', 'retatrutide', 'rgt075', 'ribupatide', 'romidepsin', 'rose010', 'sal0112', 'semaglutidebiosimilar', 'semaglutide', 'sevabertinib', 'sl209', 'sunvozertinib', 'survodutide', 'te8105', 'telisotuzumabvedotin', 'tern601', 'thdbh120', 'tirzapatide', 'tirzepatide', 'topotecan', 'ttp273', 'ubt251', 'unie4', 'utreglutide', 'vct220', 'vk2735', 'vorasidenib', 'vurolenatide', 'zenagamtide', 'zenocutuzumab', 'zolbetuximab', 'zoledronicacid', 'zongertinib', 'zovaglutide', 'amivantamabandhyaluronidaseipuj', 'capivasertib']	'2026-07-15T01:54:24.202698Z
+6a56e8500002deb1dffad007		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:24.197130716Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[GCS] Found 9316 total objects under prefix	'2026-07-15T01:54:24.188081Z
+6a56e83c000158abceae7803		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:04.228175033Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[GCS] Listing PDFs for 'Orforglipron Calcium' under gs://cognito-gcs/Cognito_new/Master_patent_list/	'2026-07-15T01:54:04.088235Z
+6a56e83c000128e61a657e41		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:04.228175033Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[STEP 1] Listing PDFs from GCS...	'2026-07-15T01:54:04.076006Z
+6a56e83c000128d3b99435b8		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:04.228175033Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[DRUG FILTER] 81 allowed GLP-1 drug name(s) loaded from cognito-prod-394707.cognito_prod_datamart.vw_drug_details_full	'2026-07-15T01:54:04.075987Z
+6a56e83a0007d31230234d7c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:02.569409061Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'============================================================	'2026-07-15T01:54:02.512786Z
+6a56e83a0007d30e9febfefa		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:02.569409061Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[PIPELINE] Starting for: Orforglipron Calcium	'2026-07-15T01:54:02.512782Z
+6a56e83a0007d305c776673c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:02.569409061Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'============================================================	'2026-07-15T01:54:02.512773Z
+6a56e83a0007a7a8539629d5		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:02.569409061Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[FORMULATION EXCEL] WARNING: No path provided and FORMULATION_EXCEL_PATH not set â€” Step 2 will run without Excel data.	'2026-07-15T01:54:02.501672Z
+6a56e83a0007a08eb64298ca		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:02.569409061Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[BQ] Config loaded: cognito-prod-394707.cognito_prod_datamart.clinical_efficacy | drug_details: cognito-prod-394707.cognito_prod_datamart.vw_drug_details	'2026-07-15T01:54:02.499854Z
+6a56e8390005df9e74a490da		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:54:01.567028355Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[ALLOYDB] Client initialized	'2026-07-15T01:54:01.384926Z
+6a56e837000a5fc5785e5aae		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:53:59.897116019Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[GCS] Config loaded: gs://cognito-gcs/Cognito_new/Master_patent_list/	'2026-07-15T01:53:59.679877Z
+6a56e837000902ed1dbd1c79		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:53:59.897116019Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  cwd: /app/Pipeline	'2026-07-15T01:53:59.590573Z
+6a56e837000902e8fdcd6b63		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:53:59.897116019Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  cmd: /usr/local/bin/python -m cog.main Orforglipron Calcium	'2026-07-15T01:53:59.590568Z
+6a56e837000902dccfdaf5a1		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:53:59.897116019Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[93mâ–¶ Patent pipeline: Orforglipron Calcium[0m	'2026-07-15T01:53:59.590556Z
+6a56e8370008d300f958c4fb		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:53:59.897116019Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  Parallelising 1 drug(s) across 1 worker(s)	'2026-07-15T01:53:59.578304Z
+6a56e8370008d2fccf05b4a3		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:53:59.897116019Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•[0m	'2026-07-15T01:53:59.578300Z
+6a56e8370008d2f73dbb578f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:53:59.897116019Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		  PATENT PROCESSING	'2026-07-15T01:53:59.578295Z
+6a56e8370008d2f350cefc56		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:53:59.897116019Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[1mâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•	'2026-07-15T01:53:59.578291Z
+6a56e8370008d2ebabf39e5c		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:53:59.897116019Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		    1. Orforglipron Calcium	'2026-07-15T01:53:59.578283Z
+6a56e8370008d2e64841fa02		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:53:59.897116019Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[MULTI-DRUG MODE] Running for 1 drug(s):	'2026-07-15T01:53:59.578278Z
+6a56e8370008d2d412ddefbd		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:53:59.897116019Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[DRUG FILTER] 81 allowed GLP-1 drug name(s) loaded from cognito-prod-394707.cognito_prod_datamart.vw_drug_details_full	'2026-07-15T01:53:59.578260Z
+6a56e835000d6945bccb4a35		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:53:57.911780360Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[FORMULATION EXCEL] WARNING: No path provided and FORMULATION_EXCEL_PATH not set â€” Step 2 will run without Excel data.	'2026-07-15T01:53:57.878917Z
+6a56e835000ce2c23184dc60		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:53:57.911780360Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[BQ] Config loaded: cognito-prod-394707.cognito_prod_datamart.clinical_efficacy | drug_details: cognito-prod-394707.cognito_prod_datamart.vw_drug_details	'2026-07-15T01:53:57.844482Z
+6a56e82e00098fb401b2581e		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:53:50.905679330Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[ALLOYDB] Client initialized	'2026-07-15T01:53:50.626612Z
+6a56e8280007120ef6fe790f		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:53:44.578470386Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'[GCS] Config loaded: gs://cognito-gcs/Cognito_new/Master_patent_list/	'2026-07-15T01:53:44.463374Z
+6a56e82800039d81d7c13fb4		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:53:44.243720744Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•[0m	'2026-07-15T01:53:44.236929Z
+6a56e82800039d7c55d00f18		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:53:44.243720744Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		'  LOE PIPELINE â€” mode=patents | workers=10 | skip-forecast=False | drug=Orforglipron Calcium | task=0/1	'2026-07-15T01:53:44.236924Z
+6a56e82800039d696dec02a6		002f8ffd47ac78d218a64d628bc0e54e631a61f4b68a1b229a3ef8cb99f4f28d9dcf12c8a7b233841bfb854916ff711302dab06f0959cf3ae2dd47ab9f40bfd561041a2f358f4e3e05b7dd0451745b7d31c2bc9926f22d8fe08ed5	'ip-dim-scoring-job-k65b8	0	0	'projects/cognito-prod-394707/logs/run.googleapis.com%2Fstdout		'2026-07-15T01:53:44.243720744Z	'ip-dim-scoring-job	'us-central1	'cognito-prod-394707	cloud_run_job		[1mâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•	'2026-07-15T01:53:44.236905Z
