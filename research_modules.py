@@ -41,7 +41,7 @@ from google.cloud import bigquery
 from google.genai import types as genai_types
 
 import medical_potential.config as config
-import gcp_utils
+import medical_potential.gcp_utils as gcp_utils
 from indication_standardizer import standardize_indications
 
 logger = logging.getLogger(__name__)
@@ -575,39 +575,33 @@ def _save_checkpoint(molecule_name: str, data: dict) -> None:
         logger.exception("Failed to save checkpoint to gs://%s/%s", config.GCS_BUCKET, blob_path)
 
 
-def _enrich_single_trial(row: dict, molecule_name: str, checkpoint: dict, cp_lock: threading.Lock):
-    """Extract indications from a single trial. Classification happens later."""
-    trial_id = row.get("trial_id")
-
-    with cp_lock:
-        if trial_id in checkpoint:
-            cp = checkpoint[trial_id]
-            return trial_id, cp["conditions"], cp["trial_title"], cp.get("phase", ""), row
-
-    prompt = f"""
+def _build_batch_trial_prompt(batch: list[dict]) -> str:
+    """Build the Gemini prompt for a batch of trials."""
+    trials_block = ""
+    for i, row in enumerate(batch, 1):
+        trials_block += f"""
+Trial {i}:
+  Trial ID : {row.get('trial_id')}
+  Molecule : {row.get('molecule_name')}
+  Company  : {row.get('company_name')}
+  Phase    : {row.get('phase')}
+  Source URL: {row.get('source_url')}
+"""
+    return f"""
 You are a clinical trial data assistant.
 
-Trial details:
-Molecule: {row.get('molecule_name')}
-Company: {row.get('company_name')}
-Trial ID: {trial_id}
-Phase: {row.get('phase')}
-Source URL: {row.get('source_url')}
+Below are {len(batch)} clinical trial(s). For EACH trial:
 
 ═══ STEP 1 — Look up the trial ═══
-Search for this trial using the Trial ID "{trial_id}" on ClinicalTrials.gov
-or other clinical trial registries (e.g. EudraCT, WHO ICTRP).
-Find the EXACT official trial title as registered.
-
-If the source URL is provided, also check that URL for the trial title.
+Search for the trial using its Trial ID on ClinicalTrials.gov or other
+clinical trial registries (EudraCT, WHO ICTRP). Find the EXACT official
+title as registered. Also check the Source URL if provided.
 
 ═══ STEP 2 — Extract indications ═══
-From the trial record, extract ALL disease indications being studied.
-Include BOTH the primary indication AND any secondary/exploratory indications
-that have documented outcomes.
-
-Look at:
-- The official trial title (most reliable source of the indication)
+Extract ALL disease indications being studied in that trial — both the
+primary indication and any secondary/exploratory indications with
+documented outcomes. Look at:
+- The official trial title (most reliable)
 - The trial's "Conditions" or "Diseases" field on the registry
 - Primary and secondary outcome measures
 - The trial description / brief summary
@@ -615,80 +609,149 @@ Look at:
 Common patterns:
 - "in subjects with type 2 diabetes" → T2DM
 - "cardiovascular outcomes" → CV Risk Reduction
-- Trial acronyms like PIONEER, SUSTAIN, STEP, SELECT often indicate specific programs
-- Outcome studies (e.g., cardiovascular, renal) count as indications
+- Trial acronyms like PIONEER, SUSTAIN, STEP, SELECT often indicate programs
+- Outcome studies (cardiovascular, renal) count as indications
 
-Return ONLY valid JSON:
+Trials:
+{trials_block}
+
+Return ONLY valid JSON — no markdown, no explanation:
 {{
-  "conditions": [
-    {{"indication": "<disease or condition>", "rationale": "<why — cite the trial record field>"}},
-    {{"indication": "<disease or condition>", "rationale": "<why>"}}
-  ],
-  "trial_title": "<EXACT official trial title as registered on the clinical trial registry>",
-  "phase": "<Phase from the registry, e.g. Phase 1, Phase 2, Phase 3, Phase 4, Phase 2/3>"
+  "trials": [
+    {{
+      "trial_id": "<Trial ID from input>",
+      "trial_title": "<EXACT official title from the registry>",
+      "phase": "<Phase from the registry, e.g. Phase 3, Phase 2/3>",
+      "conditions": [
+        {{"indication": "<disease or condition>", "rationale": "<cite the registry field>"}},
+        ...
+      ]
+    }},
+    ...
+  ]
 }}
 
 Rules:
-- trial_title must be the EXACT title from the registry, not a summary or guess
-- phase must match what the registry lists (e.g. Phase 3, Phase 2/Phase 3)
-- Include ALL indications the trial is evaluating
-- Always extract at least the primary indication
-- No explanations outside the JSON
+- Return one entry per trial, in the same order as the input.
+- trial_title must be the EXACT registry title, not a summary or guess.
+- phase must match what the registry lists.
+- Include ALL indications the trial evaluates; always include at least the primary.
+- No explanations outside the JSON.
 """
+
+
+def _normalize_conditions(raw_conditions) -> list[dict]:
+    """Normalize a conditions value from Gemini into a clean list of dicts."""
+    if not isinstance(raw_conditions, list):
+        raw_conditions = [{"indication": str(raw_conditions), "rationale": ""}]
+
+    normalized = []
+    for c in raw_conditions:
+        if isinstance(c, dict):
+            normalized.append({
+                "indication": (c.get("indication") or "").strip(),
+                "rationale": (c.get("rationale") or "").strip(),
+            })
+        elif isinstance(c, str) and c.strip():
+            normalized.append({"indication": c.strip(), "rationale": ""})
+
+    seen, deduped = set(), []
+    for c in normalized:
+        key = (c["indication"] or "").lower()
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(c)
+    return deduped
+
+
+def _enrich_trial_batch(
+    batch: list[dict],
+    molecule_name: str,
+    checkpoint: dict,
+    cp_lock: threading.Lock,
+) -> list[tuple]:
+    """Extract indications for a batch of trials in a single Gemini call.
+
+    Trials already in the checkpoint are skipped and returned directly.
+    Returns a list of (trial_id, conditions, trial_title, phase, row) tuples
+    in the same order as *batch*.
+    """
+    # Split into cached and uncached
+    cached_results = {}
+    uncached_rows = []
+    with cp_lock:
+        for row in batch:
+            tid = row.get("trial_id")
+            if tid in checkpoint:
+                cp = checkpoint[tid]
+                cached_results[tid] = (tid, cp["conditions"], cp["trial_title"], cp.get("phase", ""), row)
+            else:
+                uncached_rows.append(row)
+
+    if not uncached_rows:
+        return [cached_results[row.get("trial_id")] for row in batch]
+
+    # Single Gemini call for all uncached trials in the batch
+    batch_results: dict[str, tuple] = {}
     try:
         text = _gemini_generate(
-            prompt,
+            _build_batch_trial_prompt(uncached_rows),
             system_instruction=(
                 "You are a clinical trial data assistant. "
-                "Search for the trial on ClinicalTrials.gov or other registries "
-                "to get the exact title. Return ONLY valid JSON."
+                "Search ClinicalTrials.gov for each trial ID to get its exact title. "
+                "Return ONLY valid JSON."
             ),
             use_search=True,
         )
         if not text:
             raise ValueError("Empty response from Gemini")
+
         data = _extract_json(text)
-        conditions = data.get("conditions", [])
-        trial_title = data.get("trial_title", "N/A")
-        extracted_phase = (data.get("phase") or "").strip()
+        trial_entries = data.get("trials", [])
 
-        if isinstance(conditions, list):
-            normalized = []
-            for c in conditions:
-                if isinstance(c, dict):
-                    normalized.append({
-                        "indication": (c.get("indication") or "").strip(),
-                        "rationale": (c.get("rationale") or "").strip(),
-                    })
-                elif isinstance(c, str) and c.strip():
-                    normalized.append({"indication": c.strip(), "rationale": ""})
-            conditions = normalized
-        else:
-            conditions = [{"indication": str(conditions), "rationale": ""}]
+        # Index by trial_id
+        gemini_map = {e.get("trial_id"): e for e in trial_entries if e.get("trial_id")}
 
-        seen, deduped = set(), []
-        for c in conditions:
-            key = (c["indication"] or "").lower()
-            if key and key not in seen:
-                seen.add(key)
-                deduped.append(c)
-        conditions = deduped
+        for row in uncached_rows:
+            tid = row.get("trial_id")
+            entry = gemini_map.get(tid)
+            if not entry:
+                logger.warning("Batch response missing trial %s — recording as empty", tid)
+                batch_results[tid] = (tid, [], "N/A", "", row)
+                continue
 
-        logger.info("%s: %s", trial_id, ", ".join(c["indication"] for c in conditions) or "no indications")
+            conditions = _normalize_conditions(entry.get("conditions", []))
+            trial_title = (entry.get("trial_title") or "N/A").strip()
+            extracted_phase = (entry.get("phase") or "").strip()
 
+            logger.info("%s: %s", tid,
+                        ", ".join(c["indication"] for c in conditions) or "no indications")
+
+            with cp_lock:
+                checkpoint[tid] = {
+                    "conditions": conditions,
+                    "trial_title": trial_title,
+                    "phase": extracted_phase,
+                }
+            batch_results[tid] = (tid, conditions, trial_title, extracted_phase, row)
+
+        # Save checkpoint once for the whole batch
         with cp_lock:
-            checkpoint[trial_id] = {
-                "conditions": conditions, "trial_title": trial_title, "phase": extracted_phase,
-            }
             _save_checkpoint(molecule_name, checkpoint)
 
     except Exception as e:
-        conditions = []
-        trial_title = str(e)
-        extracted_phase = ""
-        logger.error("%s: %s", trial_id, e)
+        logger.error("Batch Gemini call failed (%s) — marking %d trial(s) as empty", e, len(uncached_rows))
+        for row in uncached_rows:
+            tid = row.get("trial_id")
+            if tid not in batch_results:
+                batch_results[tid] = (tid, [], str(e), "", row)
 
-    return trial_id, conditions, trial_title, extracted_phase, row
+    # Return in original batch order
+    final = []
+    for row in batch:
+        tid = row.get("trial_id")
+        final.append(cached_results.get(tid) or batch_results.get(tid) or (tid, [], "", "", row))
+    return final
 
 
 def _gemini_enrich_trials(rows: list[dict], molecule_name: str) -> list[dict]:
@@ -698,28 +761,35 @@ def _gemini_enrich_trials(rows: list[dict], molecule_name: str) -> list[dict]:
     checkpoint = _load_checkpoint(molecule_name)
     cp_lock = threading.Lock()
 
-    logger.info("Checkpoint: %d trial(s) already completed", len(checkpoint))
-    logger.info("Processing %d trial(s) with %d parallel worker(s)", total, config.MAX_WORKERS_TRIALS)
+    batch_size = max(1, config.TRIAL_BATCH_SIZE)
+    batches = [rows[i:i + batch_size] for i in range(0, total, batch_size)]
 
-    # ── STEP 1: Parallel extraction ──────────────────────────────────────
-    results = []
+    logger.info("Checkpoint: %d trial(s) already completed", len(checkpoint))
+    logger.info(
+        "Processing %d trial(s) in %d batch(es) of up to %d (parallelism: %d workers)",
+        total, len(batches), batch_size, config.MAX_WORKERS_TRIALS,
+    )
+
+    # ══ STEP 1: Parallel batch extraction ════════════════════════════════════
+    # Each worker handles one batch (= one Gemini call for TRIAL_BATCH_SIZE trials).
+    batch_outputs: list = [None] * len(batches)
     with ThreadPoolExecutor(max_workers=config.MAX_WORKERS_TRIALS) as executor:
         futures = {
-            executor.submit(_enrich_single_trial, row, molecule_name, checkpoint, cp_lock): i
-            for i, row in enumerate(rows)
+            executor.submit(_enrich_trial_batch, batch, molecule_name, checkpoint, cp_lock): i
+            for i, batch in enumerate(batches)
         }
         for future in as_completed(futures):
-            idx = futures[future]
+            i = futures[future]
             try:
-                results.append(future.result())
+                batch_outputs[i] = future.result()
             except Exception as e:
-                row = rows[idx]
-                logger.error("Unexpected error for trial %s: %s", row.get("trial_id"), e)
-                results.append((row.get("trial_id"), [], str(e), "", row))
+                logger.error("Unexpected error in batch %d: %s", i, e)
+                batch_outputs[i] = [
+                    (row.get("trial_id"), [], str(e), "", row) for row in batches[i]
+                ]
 
-    # Restore original order
-    trial_order = {row.get("trial_id"): i for i, row in enumerate(rows)}
-    results.sort(key=lambda r: trial_order.get(r[0], 0))
+    # Flatten batches in original order
+    results = [item for batch in batch_outputs for item in batch]
 
     # ── Collect all raw indications and batch-standardise in one call ────
     all_raws = [
