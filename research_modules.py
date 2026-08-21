@@ -42,7 +42,7 @@ from google.genai import types as genai_types
 
 import medical_potential.config as config
 import gcp_utils
-from indication_standardizer import standardize_indication
+from indication_standardizer import standardize_indications
 
 logger = logging.getLogger(__name__)
 
@@ -721,6 +721,15 @@ def _gemini_enrich_trials(rows: list[dict], molecule_name: str) -> list[dict]:
     trial_order = {row.get("trial_id"): i for i, row in enumerate(rows)}
     results.sort(key=lambda r: trial_order.get(r[0], 0))
 
+    # ── Collect all raw indications and batch-standardise in one call ────
+    all_raws = [
+        c.get("indication", "")
+        for _, conditions, _, _, _ in results
+        for c in (conditions or [])
+        if c.get("indication", "")
+    ]
+    standardization_map = standardize_indications(all_raws)
+
     # ── Unnest into flat rows (no classification yet) ────────────────────
     flat_rows = []
     for trial_id, conditions, trial_title, extracted_phase, row in results:
@@ -745,7 +754,7 @@ def _gemini_enrich_trials(rows: list[dict], molecule_name: str) -> list[dict]:
             raw = c.get("indication", "")
             if not raw:
                 continue
-            std = standardize_indication(raw)
+            std = standardization_map.get(raw, raw)
             if not std or std.lower() in ("error", "n/a", "no indication found", "none"):
                 continue
             if std.lower() in seen:
@@ -949,15 +958,12 @@ def _research_single_source(q: dict, molecule: str, company: str) -> tuple[str, 
             raw = e.get("indication", "").strip()
             if not raw:
                 continue
-            std = standardize_indication(raw)
-            if not std or std.lower() in ("error", "n/a", "none", "no indication found"):
-                continue
             rationale = (e.get("rationale") or e.get("detail") or "").strip()
 
             rows.append({
                 "molecule_name": molecule.title(),
                 "company_name": company,
-                "indication": std,
+                "indication": raw,      # standardised in batch by _innovator_research
                 "rationale": rationale,
                 "indication_type": "",  # filled later by classification
                 "therapy_area": "",     # filled later by classification
@@ -993,6 +999,19 @@ def _innovator_research(molecule: str, company: str) -> list[dict]:
                 all_rows.extend(rows)
             except Exception as ex:
                 logger.error("%s: %s", source_type, ex)
+
+    # ── Batch-standardise all raw indications in one Gemini + Search call ─
+    raw_indications = [row["indication"] for row in all_rows if row["indication"]]
+    standardization_map = standardize_indications(raw_indications)
+    for row in all_rows:
+        raw = row["indication"]
+        std = standardization_map.get(raw, raw)
+        if not std or std.lower() in ("error", "n/a", "none", "no indication found"):
+            std = ""
+        row["indication"] = std
+
+    # Remove rows whose indication could not be resolved
+    all_rows = [r for r in all_rows if r["indication"]]
 
     # Deduplicate
     seen, unique = set(), []
