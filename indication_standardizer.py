@@ -282,25 +282,45 @@ def standardize_indications(raws: list[str]) -> dict[str, str]:
     if not to_resolve:
         return result
 
-    # Batch call
-    batch_map = _batch_standardize_via_gemini(to_resolve)
+    # Process in batches of INDICATION_BATCH_SIZE
+    batch_size = max(1, config.INDICATION_BATCH_SIZE)
+    # Deduplicate to_resolve (preserving order) so we don't send the same string twice
+    seen_resolve = set()
+    unique_to_resolve = []
+    for r in to_resolve:
+        if r.lower() not in seen_resolve:
+            seen_resolve.add(r.lower())
+            unique_to_resolve.append(r)
 
-    # Individual fallback for any missed by the batch
-    missed = [r for r in to_resolve if r.lower() not in batch_map]
-    if missed:
-        logger.info("[standardizer] %d indication(s) missing from batch — resolving individually", len(missed))
-    for raw in missed:
-        canonical = _standardize_single_via_gemini(raw)
-        if not canonical:
-            canonical = raw  # preserve raw rather than silently dropping
-            logger.debug("[standardizer] Could not resolve '%s' — keeping raw", raw)
-        batch_map[raw.lower()] = canonical
+    batches = [unique_to_resolve[i:i + batch_size] for i in range(0, len(unique_to_resolve), batch_size)]
+    logger.info(
+        "[standardizer] Standardising %d unique indication(s) in %d batch(es) of up to %d",
+        len(unique_to_resolve), len(batches), batch_size,
+    )
+
+    full_batch_map: dict[str, str] = {}
+    for i, batch in enumerate(batches, 1):
+        logger.info("[standardizer] Standardisation batch %d/%d (%d indications)", i, len(batches), len(batch))
+        batch_map = _batch_standardize_via_gemini(batch)
+
+        # Individual fallback for any missed by the batch
+        missed = [r for r in batch if r.lower() not in batch_map]
+        if missed:
+            logger.info("[standardizer] %d indication(s) missing from batch %d — resolving individually", len(missed), i)
+        for raw in missed:
+            canonical = _standardize_single_via_gemini(raw)
+            if not canonical:
+                canonical = raw  # preserve raw rather than silently dropping
+                logger.debug("[standardizer] Could not resolve '%s' — keeping raw", raw)
+            batch_map[raw.lower()] = canonical
+
+        full_batch_map.update(batch_map)
 
     # Merge into result and update cache
     with _cache_lock:
         for raw in to_resolve:
             key = raw.lower()
-            canonical = batch_map.get(key, raw)  # fallback to raw
+            canonical = full_batch_map.get(key, raw)  # fallback to raw
             result[raw] = canonical
             _cache[key] = canonical
             logger.debug("[standardizer] '%s' → '%s'", raw, canonical)
