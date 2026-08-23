@@ -42,7 +42,7 @@ from google.genai import types as genai_types
 
 import medical_potential.config as config
 import medical_potential.gcp_utils as gcp_utils
-from indication_standardizer import standardize_indications
+from medical_potential.label_expansion.indication_standardizer import standardize_indications
 
 logger = logging.getLogger(__name__)
 
@@ -861,6 +861,15 @@ def _gemini_enrich_trials(rows: list[dict], molecule_name: str) -> list[dict]:
                 and (row.get("therapy_area") or "").lower() != "metabolic"):
             row["indication_type"] = "Secondary"
 
+    # TA-I (Therapy Area - Indication) — only for Secondary indications
+    for row in flat_rows:
+        if (row.get("indication_type") or "").lower() == "secondary":
+            ta = (row.get("therapy_area") or "").strip()
+            ind = (row.get("indication") or "").strip()
+            row["TA-I"] = f"{ta} - {ind}" if ta and ind else ""
+        else:
+            row["TA-I"] = ""
+
     # ── STEP 3: Ep (row-wise, only for Primary/Secondary) ─────────────
     for row in flat_rows:
         ind_type = (row.get("indication_type") or "").lower()
@@ -1105,6 +1114,15 @@ def _innovator_research(molecule: str, company: str) -> list[dict]:
         if ((row.get("indication_type") or "").lower() == "primary"
                 and (row.get("therapy_area") or "").lower() != "metabolic"):
             row["indication_type"] = "Secondary"
+
+    # TA-I (Therapy Area - Indication) — only for Secondary indications
+    for row in unique:
+        if (row.get("indication_type") or "").lower() == "secondary":
+            ta = (row.get("therapy_area") or "").strip()
+            ind = (row.get("indication") or "").strip()
+            row["TA-I"] = f"{ta} - {ind}" if ta and ind else ""
+        else:
+            row["TA-I"] = ""
 
     # ── Ep (row-wise, only for Primary/Secondary) ──────────────────────
     for row in unique:
