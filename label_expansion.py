@@ -6,23 +6,21 @@ The main entry point for the label-expansion pipeline. This file contains
 ONLY orchestration: read config, call the two research modules, write the
 Excel output, and handle the CLI. All of the actual work lives elsewhere:
 
-    medical_potential/config.py   all tunables (which drug, model, table, bucket...)
-    gcp_utils.py          BigQuery + GCS (the ONLY module that talks to GCP)
-    gemini_utils.py        Gemini client, prompting, classification, Ep/Et scoring
-    research_modules.py     Module A (Clinical Efficacy) + Module B (Drug Indication Research)
-    excel_writer.py         builds the .xlsx workbook from the two modules' rows
+    medical_potential/config.py                         all tunables
+    medical_potential/gcp_utils.py                      BigQuery + GCS helpers
+    medical_potential/label_expansion/research_modules.py  Module A + Module B
+    medical_potential/label_expansion/excel_writer.py      builds .xlsx workbook
+    medical_potential/label_expansion/indication_standardizer.py  batch normalizer
 
-Usage
------
-    # 1. Set INPUT_DRUG (and any other variables) in config.py, then:
-    python label_expansion.py
-
-    # 2. Or override the configured drug for a single run:
-    python label_expansion.py tirzepatide
+Usage (run as package)
+----------------------
+    python -m medical_potential.label_expansion
+    python -m medical_potential.label_expansion tirzepatide
+    python -m medical_potential.label_expansion tirzepatide --company "Eli Lilly"
 
 Programmatic usage
 -------------------
-    from label_expansion import run
+    from medical_potential.label_expansion.label_expansion import run
     output_path = run("tirzepatide")
 """
 
@@ -34,8 +32,8 @@ import sys
 from pathlib import Path
 
 import medical_potential.config as config
-import excel_writer
-import research_modules
+from medical_potential.label_expansion import excel_writer
+from medical_potential.label_expansion import research_modules
 
 logger = logging.getLogger(__name__)
 
