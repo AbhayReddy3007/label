@@ -95,8 +95,13 @@ GEMINI_RETRY_BASE_DELAY_SECONDS: int = _env_int("GEMINI_RETRY_BASE_DELAY_SECONDS
 # ══════════════════════════════════════════════════════════════════════════
 #  CONCURRENCY — label_expansion pipeline
 # ══════════════════════════════════════════════════════════════════════════
-MAX_WORKERS_TRIALS: int = _env_int("MAX_WORKERS_TRIALS", 10)      # clinical-trial extraction
+MAX_WORKERS_TRIALS: int = _env_int("MAX_WORKERS_TRIALS", 10)      # parallel batch workers
 MAX_WORKERS_INNOVATOR: int = _env_int("MAX_WORKERS_INNOVATOR", 5)  # innovator-source research
+
+# Number of trials to send to Gemini in a single call for indication extraction.
+# Higher = fewer LLM calls but larger prompts; lower = more calls but easier for
+# Gemini to look up each trial precisely. Recommended range: 3-10.
+TRIAL_BATCH_SIZE: int = _env_int("TRIAL_BATCH_SIZE", 5)
 
 # ══════════════════════════════════════════════════════════════════════════
 #  OUTPUT — label_expansion pipeline
