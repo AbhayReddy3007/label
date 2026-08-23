@@ -28,10 +28,10 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════════
 HEADERS = [
     "molecule_name", "company_name", "indication", "rationale",
-    "indication_type", "therapy_area", "trial_title", "trial_id",
+    "indication_type", "therapy_area", "TA-I", "trial_title", "trial_id",
     "phase", "source_url", "data_source", "Ep", "Et",
 ]
-COL_WIDTHS = [18, 22, 28, 40, 16, 18, 50, 18, 10, 40, 16, 8, 8]
+COL_WIDTHS = [18, 22, 28, 40, 16, 18, 36, 50, 18, 10, 40, 16, 8, 8]
 
 
 def _thin_border() -> Border:
