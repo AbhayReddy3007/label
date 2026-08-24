@@ -244,16 +244,12 @@ def _extract_json(text: str) -> dict | list:
 # ══════════════════════════════════════════════════════════════════════════
 #  CLASSIFICATION — Primary / Secondary + therapy area (LLM + Search)
 # ══════════════════════════════════════════════════════════════════════════
-def classify_indications_with_llm(molecule_name: str, unique_indications: list[str]) -> dict:
-    """Use Gemini + Google Search to research the drug and classify each
-    indication as Primary / Secondary, and assign therapy areas.
+def _classify_indication_batch(molecule_name: str, batch: list[str]) -> dict:
+    """Classify a batch of indications in a single Gemini + Search call.
 
     Returns dict: indication_name(lower) → {indication_type, therapy_area, rationale}
     """
-    if not unique_indications:
-        return {}
-
-    indications_json = json.dumps(unique_indications, indent=2)
+    indications_json = json.dumps(batch, indent=2)
 
     prompt = f"""
 You are a pharmaceutical analyst. Your task is to research the drug
@@ -313,9 +309,6 @@ Return ONLY valid JSON — no markdown fences, no explanation:
   ]
 }}
 """
-
-    logger.info("Classifying %d unique indication(s) for %s (LLM + Search)",
-                len(unique_indications), molecule_name)
     try:
         text = _gemini_generate(
             prompt,
@@ -343,7 +336,7 @@ Return ONLY valid JSON — no markdown fences, no explanation:
                 logger.debug("%s: %s | %s", name, c.get("indication_type"), c.get("therapy_area"))
 
         # Retry missing indications individually
-        for ind in unique_indications:
+        for ind in batch:
             if ind.lower() not in result:
                 logger.info("Missing classification for '%s' — retrying individually", ind)
                 result[ind.lower()] = _classify_single_indication(molecule_name, ind)
@@ -351,11 +344,39 @@ Return ONLY valid JSON — no markdown fences, no explanation:
         return result
 
     except Exception as e:
-        logger.warning("Bulk classification failed (%s) — classifying each indication individually", e)
+        logger.warning("Batch classification failed (%s) — classifying each individually", e)
         result = {}
-        for ind in unique_indications:
+        for ind in batch:
             result[ind.lower()] = _classify_single_indication(molecule_name, ind)
         return result
+
+
+def classify_indications_with_llm(molecule_name: str, unique_indications: list[str]) -> dict:
+    """Use Gemini + Google Search to research the drug and classify each
+    indication as Primary / Secondary, and assign therapy areas.
+
+    Processes indications in batches of config.INDICATION_BATCH_SIZE.
+
+    Returns dict: indication_name(lower) → {indication_type, therapy_area, rationale}
+    """
+    if not unique_indications:
+        return {}
+
+    batch_size = max(1, config.INDICATION_BATCH_SIZE)
+    batches = [unique_indications[i:i + batch_size] for i in range(0, len(unique_indications), batch_size)]
+
+    logger.info(
+        "Classifying %d unique indication(s) for %s in %d batch(es) of up to %d",
+        len(unique_indications), molecule_name, len(batches), batch_size,
+    )
+
+    result = {}
+    for i, batch in enumerate(batches, 1):
+        logger.info("Classification batch %d/%d (%d indications)", i, len(batches), len(batch))
+        batch_result = _classify_indication_batch(molecule_name, batch)
+        result.update(batch_result)
+
+    return result
 
 
 def _classify_single_indication(molecule_name: str, indication: str) -> dict:
@@ -498,6 +519,81 @@ No explanation.
     except Exception as e:
         logger.warning("Niche check failed (%s) — defaulting to non-niche", e)
         return False
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  APPROVAL CHECK — for Phase 3 secondary indications (Score Calculation)
+# ══════════════════════════════════════════════════════════════════════════
+def check_phase3_approvals(
+    molecule: str,
+    indications: list[str],
+) -> dict[str, bool]:
+    """Check whether Phase 3 secondary indications are already approved.
+
+    Uses Gemini + Google Search to look up FDA/EMA approval status for
+    each indication. Returns a map of indication → is_approved (bool).
+    Called by the Score Calculation sheet builder so that Phase 3 rows
+    that are actually approved get a maturity weight of 1.0 instead of 0.6.
+    """
+    if not indications:
+        return {}
+
+    indications_json = json.dumps(indications, indent=2)
+    prompt = f"""
+You are a pharmaceutical regulatory analyst.
+
+Drug / Molecule: {molecule}
+
+The following indications are currently listed as Phase 3 in clinical trials
+for this drug. For EACH one, search the web to determine whether this drug
+has ALREADY received regulatory approval (FDA or EMA) for that specific
+indication.
+
+Indications to check:
+{indications_json}
+
+Return ONLY valid JSON — no markdown, no explanation:
+{{
+  "approvals": [
+    {{"indication": "<exact indication from list>", "is_approved": true/false}},
+    ...
+  ]
+}}
+"""
+    result: dict[str, bool] = {ind: False for ind in indications}
+
+    try:
+        text = _gemini_generate(
+            prompt,
+            system_instruction=(
+                "You are a pharmaceutical regulatory analyst. "
+                "Search the web for FDA and EMA approval status. "
+                "Return ONLY valid JSON."
+            ),
+            use_search=True,
+        )
+        if not text:
+            logger.warning("Empty response from approval check — defaulting all to not approved")
+            return result
+        data = _extract_json(text)
+        for entry in data.get("approvals", []):
+            ind = (entry.get("indication") or "").strip()
+            if ind:
+                # Match case-insensitively against input list
+                for orig in indications:
+                    if orig.lower() == ind.lower():
+                        result[orig] = bool(entry.get("is_approved", False))
+                        break
+        logger.info(
+            "Approval check for %s: %d/%d approved",
+            molecule,
+            sum(1 for v in result.values() if v),
+            len(result),
+        )
+    except Exception as e:
+        logger.warning("Approval check failed (%s) — defaulting all to not approved", e)
+
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════
