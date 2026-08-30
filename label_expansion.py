@@ -72,6 +72,11 @@ def run(drug: str | None = None, company: str | None = None) -> Path:
     if not clinical_rows and not indication_rows:
         logger.warning("No data found for '%s' from either Clinical Trials or Indication Research", drug)
 
+    # ── Map OpenTargets association scores onto clinical rows too ──────
+    if opentargets_rows and clinical_rows:
+        logger.info("Mapping OpenTargets association scores onto clinical efficacy rows")
+        research_modules._apply_opentargets_scores(clinical_rows, opentargets_rows, moa_list)
+
     out_file = excel_writer.write_excel(
         drug,
         clinical_rows,
