@@ -1382,6 +1382,151 @@ def _build_opentargets_rows(
     return rows
 
 
+def _match_indications_to_opentargets(
+    pipeline_indications: list[str],
+    ot_disease_names: list[str],
+) -> dict[str, str]:
+    """Use Gemini to match pipeline indication names to OpenTargets disease names.
+
+    Returns dict: pipeline_indication(lower) → matched OpenTargets disease name.
+    Only contains entries where a confident match was found.
+    """
+    if not pipeline_indications or not ot_disease_names:
+        return {}
+
+    # Deduplicate inputs
+    unique_pipeline = sorted(set(pipeline_indications))
+    unique_ot = sorted(set(ot_disease_names))
+
+    pipeline_json = json.dumps(unique_pipeline, indent=2)
+    ot_json = json.dumps(unique_ot, indent=2)
+
+    prompt = f"""
+You are a biomedical terminology expert.
+
+I have two lists of disease/indication names. List A comes from clinical
+trials and regulatory sources. List B comes from the OpenTargets platform.
+
+Your task: for EACH indication in List A, find the BEST matching disease
+name in List B. Diseases may use different names for the same condition
+(e.g. "T2DM" matches "type II diabetes mellitus", "CKD" matches
+"chronic kidney disease", "NASH" matches "non-alcoholic steatohepatitis",
+"CV Risk Reduction" matches "cardiovascular disease").
+
+Match by medical equivalence, not just string similarity. Only match if
+the conditions are clinically the same or one is a clear subset of the other.
+If there is no confident match in List B, set matched_ot_name to "".
+
+List A (pipeline indications):
+{pipeline_json}
+
+List B (OpenTargets diseases):
+{ot_json}
+
+Return ONLY valid JSON — no markdown, no explanation:
+{{
+  "matches": [
+    {{"indication": "<exact name from List A>", "matched_ot_name": "<exact name from List B or empty>"}}
+  ]
+}}
+"""
+    try:
+        text = _gemini_generate(
+            prompt,
+            system_instruction=(
+                "You are a biomedical terminology expert. "
+                "Return ONLY valid JSON."
+            ),
+            use_search=False,
+        )
+        if not text:
+            return {}
+        data = _extract_json(text)
+        matches = data.get("matches", [])
+
+        result = {}
+        ot_set_lower = {n.lower(): n for n in unique_ot}
+        for m in matches:
+            ind = (m.get("indication") or "").strip()
+            matched = (m.get("matched_ot_name") or "").strip()
+            if ind and matched and matched.lower() in ot_set_lower:
+                # Use the exact OT name (preserving original casing from OT)
+                result[ind.lower()] = ot_set_lower[matched.lower()]
+        logger.info("Matched %d/%d pipeline indications to OpenTargets diseases",
+                     len(result), len(unique_pipeline))
+        return result
+    except Exception as e:
+        logger.warning("Indication-to-OpenTargets matching failed: %s", e)
+        return {}
+
+
+def _apply_opentargets_scores(
+    rows: list[dict],
+    opentargets_rows: list[dict],
+    moa_list: list[str],
+) -> None:
+    """Stamp opentargets_score and moa onto existing indication rows by
+    matching their indication names to OpenTargets disease names.
+
+    Also renames matched indications to use the OpenTargets disease name
+    so names are consistent across all sheets.
+    """
+    if not opentargets_rows:
+        return
+
+    # Build lookup: ot_disease_name(lower) → best score
+    ot_score_lookup: dict[str, float] = {}
+    for otr in opentargets_rows:
+        name = (otr.get("indication") or "").lower()
+        score = otr.get("opentargets_score", 0.0)
+        if name and isinstance(score, (int, float)):
+            if name not in ot_score_lookup or score > ot_score_lookup[name]:
+                ot_score_lookup[name] = score
+
+    ot_disease_names = list({otr["indication"] for otr in opentargets_rows if otr.get("indication")})
+
+    # Collect unique pipeline indications
+    pipeline_indications = list({
+        r["indication"] for r in rows
+        if r.get("indication") and r["indication"] != "No indication found"
+    })
+
+    # First pass: direct lowercase match
+    direct_matched = set()
+    for row in rows:
+        ind_lower = (row.get("indication") or "").lower()
+        if ind_lower in ot_score_lookup:
+            row["opentargets_score"] = ot_score_lookup[ind_lower]
+            if moa_list and not row.get("moa"):
+                row["moa"] = "; ".join(moa_list)
+            direct_matched.add(ind_lower)
+
+    # Remaining unmatched indications → use Gemini for fuzzy matching
+    unmatched = [ind for ind in pipeline_indications if ind.lower() not in direct_matched]
+    if unmatched and ot_disease_names:
+        gemini_map = _match_indications_to_opentargets(unmatched, ot_disease_names)
+
+        for row in rows:
+            ind = (row.get("indication") or "")
+            if ind.lower() in direct_matched:
+                continue  # already matched directly
+            ot_name = gemini_map.get(ind.lower())
+            if ot_name:
+                score = ot_score_lookup.get(ot_name.lower(), "")
+                row["opentargets_score"] = score
+                # Rename indication to the OpenTargets disease name for consistency
+                row["indication"] = ot_name
+                if moa_list and not row.get("moa"):
+                    row["moa"] = "; ".join(moa_list)
+
+    # Set moa on all rows if available
+    if moa_list:
+        moa_str = "; ".join(moa_list)
+        for row in rows:
+            if not row.get("moa"):
+                row["moa"] = moa_str
+
+
 def _run_opentargets_pipeline(molecule: str, company: str) -> tuple[list[dict], list[str]]:
     """Full OpenTargets pipeline: fetch MOA → resolve Ensembl IDs → query diseases.
 
@@ -1519,5 +1664,10 @@ def run_indication_research(
 
     # ── OpenTargets pipeline (MOA → target → diseases) ─────────────────
     opentargets_rows, moa_list = _run_opentargets_pipeline(molecule, company)
+
+    # ── Map OT scores back onto indication rows ───────────────────────
+    if opentargets_rows:
+        logger.info("Mapping OpenTargets association scores onto indication rows")
+        _apply_opentargets_scores(indication_rows, opentargets_rows, moa_list)
 
     return indication_rows, opentargets_rows, moa_list
