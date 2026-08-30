@@ -50,6 +50,10 @@ CLINICAL_TRIALS_TABLE: str = os.getenv("CLINICAL_TRIALS_TABLE", "clinical_effica
 # Table used by gcp_utils.append_dimension_score_to_bigquery (medical_potential pipeline).
 DIM_SCORES_TABLE: str = os.getenv("DIM_SCORES_TABLE", "")
 
+# MOA lookup table — contains Cleaned_Generic_Name and Mechanism_of_Action columns.
+# Used to extract the mechanism of action for each drug.
+MOA_LOOKUP_TABLE: str = os.getenv("MOA_LOOKUP_TABLE", "")
+
 # ══════════════════════════════════════════════════════════════════════════
 #  GOOGLE CLOUD — STORAGE (GCS)
 # ══════════════════════════════════════════════════════════════════════════
@@ -102,6 +106,10 @@ MAX_WORKERS_INNOVATOR: int = _env_int("MAX_WORKERS_INNOVATOR", 5)  # innovator-s
 # Higher = fewer LLM calls but larger prompts; lower = more calls but easier for
 # Gemini to look up each trial precisely. Recommended range: 3-10.
 TRIAL_BATCH_SIZE: int = _env_int("TRIAL_BATCH_SIZE", 5)
+
+# Number of unique indications per Gemini call for standardisation and
+# classification. Each batch is one LLM call. Recommended range: 5-15.
+INDICATION_BATCH_SIZE: int = _env_int("INDICATION_BATCH_SIZE", 10)
 
 # ══════════════════════════════════════════════════════════════════════════
 #  OUTPUT — label_expansion pipeline
