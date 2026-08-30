@@ -14,6 +14,14 @@ These are the two data-gathering modules `label_expansion.py` orchestrates:
       types: regulatory labels, investor presentations, press releases,
       pipeline pages, and SEC filings.
 
+      Additionally:
+        - Searches online for approved secondary indications with their
+          trial phases.
+        - Fetches the drug's Mechanism of Action (MOA) from BigQuery.
+        - Uses Gemini+Search to find the OpenTargets Ensembl code for the MOA.
+        - Queries the OpenTargets GraphQL API to find associated diseases
+          and their association scores.
+
 Both modules share the same Gemini plumbing, Primary/Secondary + therapy
 area classification, and Ep/Et scoring (all defined in this file), and
 return a flat list of row dicts in the common format that excel_writer.py
@@ -36,6 +44,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
 from google import genai
 from google.cloud import bigquery
 from google.genai import types as genai_types
@@ -522,81 +531,6 @@ No explanation.
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  APPROVAL CHECK — for Phase 3 secondary indications (Score Calculation)
-# ══════════════════════════════════════════════════════════════════════════
-def check_phase3_approvals(
-    molecule: str,
-    indications: list[str],
-) -> dict[str, bool]:
-    """Check whether Phase 3 secondary indications are already approved.
-
-    Uses Gemini + Google Search to look up FDA/EMA approval status for
-    each indication. Returns a map of indication → is_approved (bool).
-    Called by the Score Calculation sheet builder so that Phase 3 rows
-    that are actually approved get a maturity weight of 1.0 instead of 0.6.
-    """
-    if not indications:
-        return {}
-
-    indications_json = json.dumps(indications, indent=2)
-    prompt = f"""
-You are a pharmaceutical regulatory analyst.
-
-Drug / Molecule: {molecule}
-
-The following indications are currently listed as Phase 3 in clinical trials
-for this drug. For EACH one, search the web to determine whether this drug
-has ALREADY received regulatory approval (FDA or EMA) for that specific
-indication.
-
-Indications to check:
-{indications_json}
-
-Return ONLY valid JSON — no markdown, no explanation:
-{{
-  "approvals": [
-    {{"indication": "<exact indication from list>", "is_approved": true/false}},
-    ...
-  ]
-}}
-"""
-    result: dict[str, bool] = {ind: False for ind in indications}
-
-    try:
-        text = _gemini_generate(
-            prompt,
-            system_instruction=(
-                "You are a pharmaceutical regulatory analyst. "
-                "Search the web for FDA and EMA approval status. "
-                "Return ONLY valid JSON."
-            ),
-            use_search=True,
-        )
-        if not text:
-            logger.warning("Empty response from approval check — defaulting all to not approved")
-            return result
-        data = _extract_json(text)
-        for entry in data.get("approvals", []):
-            ind = (entry.get("indication") or "").strip()
-            if ind:
-                # Match case-insensitively against input list
-                for orig in indications:
-                    if orig.lower() == ind.lower():
-                        result[orig] = bool(entry.get("is_approved", False))
-                        break
-        logger.info(
-            "Approval check for %s: %d/%d approved",
-            molecule,
-            sum(1 for v in result.values() if v),
-            len(result),
-        )
-    except Exception as e:
-        logger.warning("Approval check failed (%s) — defaulting all to not approved", e)
-
-    return result
-
-
-# ══════════════════════════════════════════════════════════════════════════
 #  MODULE A — CLINICAL EFFICACY (BigQuery clinical trials + Gemini)
 # ══════════════════════════════════════════════════════════════════════════
 def _fetch_clinical_trials(molecule_name: str) -> list[dict]:
@@ -1002,7 +936,7 @@ def _identify_company(molecule: str) -> str:
         text = _gemini_generate(
             (
                 f"Who is the innovator pharmaceutical company that developed {molecule}? "
-                f'Return ONLY JSON: {{"company": "<name>", "brand_names": ["name1"]}}'
+                f'Return ONLY JSON: {{"company": "<n>", "brand_names": ["name1"]}}'
             ),
             system_instruction="Return ONLY valid JSON. No markdown.",
             use_search=True,
@@ -1156,6 +1090,326 @@ def _research_single_source(q: dict, molecule: str, company: str) -> tuple[str, 
     return source_type, rows
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  APPROVED SECONDARY INDICATIONS LOOKUP (Gemini + Search)
+# ══════════════════════════════════════════════════════════════════════════
+def _search_approved_secondary_indications(molecule: str, company: str) -> list[dict]:
+    """Search online for approved secondary (label-expansion) indications
+    for the given drug and return rows with their trial phases."""
+    logger.info("Searching for approved secondary indications for '%s'", molecule)
+    prompt = f"""
+You are a pharmaceutical regulatory analyst.
+
+Drug / Molecule: {molecule}
+Innovator Company: {company}
+
+Search the web for ALL approved secondary indications (label expansions) for
+"{molecule}". These are indications that were approved AFTER the original /
+primary approval.
+
+For EACH approved secondary indication, provide:
+  - The exact indication name
+  - The phase at which it is (e.g. "Approved", "Phase 3", "Phase 2", "Phase 1")
+  - The approval year (if approved)
+  - The regulatory body (FDA, EMA, etc.)
+  - A source URL
+
+Return ONLY valid JSON — no markdown, no explanation:
+{{
+  "approved_secondary_indications": [
+    {{
+      "indication": "<canonical indication name>",
+      "phase": "<Approved / Phase 3 / Phase 2 / Phase 1>",
+      "approval_year": "<year or empty string if not yet approved>",
+      "regulatory_body": "<FDA / EMA / etc.>",
+      "source_url": "<URL>",
+      "rationale": "<brief explanation of the label expansion>"
+    }}
+  ]
+}}
+"""
+    rows = []
+    try:
+        text = _gemini_generate(
+            prompt,
+            system_instruction=(
+                "You are a pharmaceutical regulatory analyst. "
+                "Search the web for approved label expansions. "
+                "Return ONLY valid JSON."
+            ),
+            use_search=True,
+        )
+        if not text:
+            logger.warning("Empty response for approved secondary indications")
+            return []
+        data = _extract_json(text)
+        entries = data.get("approved_secondary_indications", [])
+        logger.info("Found %d approved secondary indication(s)", len(entries))
+
+        for e in entries:
+            raw = (e.get("indication") or "").strip()
+            if not raw:
+                continue
+            phase = (e.get("phase") or "").strip()
+            approval_year = (e.get("approval_year") or "").strip()
+            reg_body = (e.get("regulatory_body") or "").strip()
+            rationale = (e.get("rationale") or "").strip()
+            detail = f"{reg_body} {approval_year}".strip() if reg_body or approval_year else ""
+            if detail and rationale:
+                rationale = f"{detail} — {rationale}"
+            elif detail:
+                rationale = detail
+
+            rows.append({
+                "molecule_name": molecule.title(),
+                "company_name": company,
+                "indication": raw,
+                "rationale": rationale,
+                "indication_type": "",
+                "therapy_area": "",
+                "trial_title": f"Approved Label Expansion ({reg_body} {approval_year})".strip(),
+                "trial_id": "",
+                "phase": phase if phase else "Approved",
+                "source_url": e.get("source_url", ""),
+                "data_source": "Approved Secondary Indications",
+            })
+    except Exception as ex:
+        logger.error("Approved secondary indications search failed: %s", ex)
+
+    return rows
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  MOA LOOKUP (BigQuery)
+# ══════════════════════════════════════════════════════════════════════════
+def _fetch_moa_from_bq(molecule_name: str) -> list[str]:
+    """Fetch the Mechanism(s) of Action for *molecule_name* from MOA_LOOKUP_TABLE.
+
+    Returns a list of individual MOA strings (already split on ';').
+    """
+    if not config.MOA_LOOKUP_TABLE:
+        logger.warning("MOA_LOOKUP_TABLE is not set — skipping MOA lookup")
+        return []
+
+    table_id = f"{config.PROJECT_ID}.{config.BQ_DATASET_ID}.{config.MOA_LOOKUP_TABLE}"
+    query = f"""
+        SELECT DISTINCT
+            Cleaned_Generic_Name,
+            moa_individual AS Mechanism_of_Action
+        FROM `{table_id}`,
+             UNNEST(SPLIT(Mechanism_of_Action, ';')) AS moa_individual
+        WHERE LOWER(Cleaned_Generic_Name) = LOWER(@molecule)
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("molecule", "STRING", molecule_name)]
+    )
+
+    logger.info("Querying MOA from %s for molecule '%s'", table_id, molecule_name)
+    try:
+        client = gcp_utils.get_bq_client()
+        results = client.query(query, job_config=job_config).result()
+        moas = []
+        for row in results:
+            moa = (row.get("Mechanism_of_Action") or "").strip()
+            if moa:
+                moas.append(moa)
+        logger.info("Retrieved %d MOA(s) for '%s': %s", len(moas), molecule_name, moas)
+        return moas
+    except Exception as e:
+        logger.error("Failed to fetch MOA from BigQuery: %s", e)
+        return []
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  OPENTARGETS INTEGRATION
+# ══════════════════════════════════════════════════════════════════════════
+OPENTARGETS_GRAPHQL_URL = "https://api.platform.opentargets.org/api/v4/graphql"
+
+
+def _find_opentargets_target_id(moa: str) -> str | None:
+    """Use Gemini + Search to find the Ensembl gene ID (ENSG...) for a given
+    Mechanism of Action target name, suitable for querying OpenTargets."""
+    prompt = f"""
+You are a bioinformatics expert.
+
+Mechanism of Action (MOA): "{moa}"
+
+From this MOA, identify the primary molecular target (protein / gene).
+Then find its Ensembl Gene ID (format: ENSG followed by 11 digits,
+e.g. ENSG00000169083) which is used on the OpenTargets Platform
+(https://platform.opentargets.org/).
+
+Search the web to find the correct Ensembl Gene ID for this target.
+
+Return ONLY valid JSON — no markdown, no explanation:
+{{"target_name": "<gene/protein name>", "ensembl_id": "<ENSG...>"}}
+If you cannot determine the Ensembl ID, return:
+{{"target_name": "<gene/protein name>", "ensembl_id": ""}}
+"""
+    try:
+        text = _gemini_generate(
+            prompt,
+            system_instruction="Return ONLY valid JSON.",
+            use_search=True,
+        )
+        if not text:
+            return None
+        data = _extract_json(text)
+        ensembl_id = (data.get("ensembl_id") or "").strip()
+        target_name = (data.get("target_name") or "").strip()
+        if ensembl_id and ensembl_id.startswith("ENSG"):
+            logger.info("MOA '%s' → target '%s' → Ensembl ID: %s", moa, target_name, ensembl_id)
+            return ensembl_id
+        else:
+            logger.warning("Could not resolve Ensembl ID for MOA '%s' (target: '%s')", moa, target_name)
+            return None
+    except Exception as e:
+        logger.warning("Failed to find OpenTargets target ID for MOA '%s': %s", moa, e)
+        return None
+
+
+def _query_opentargets_diseases(ensembl_id: str, max_diseases: int = 200) -> list[dict]:
+    """Query the OpenTargets GraphQL API for diseases associated with a target.
+
+    Returns list of dicts with keys: disease_id, disease_name, association_score,
+    therapy_areas.
+    """
+    query_string = """
+    query targetDiseases($ensemblId: String!, $size: Int!) {
+      target(ensemblId: $ensemblId) {
+        id
+        approvedSymbol
+        approvedName
+        associatedDiseases(page: {size: $size, index: 0}) {
+          count
+          rows {
+            score
+            disease {
+              id
+              name
+              therapeuticAreas {
+                id
+                name
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    variables = {"ensemblId": ensembl_id, "size": max_diseases}
+
+    logger.info("Querying OpenTargets for diseases associated with %s", ensembl_id)
+    try:
+        resp = requests.post(
+            OPENTARGETS_GRAPHQL_URL,
+            json={"query": query_string, "variables": variables},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        api_data = resp.json()
+
+        target_data = api_data.get("data", {}).get("target")
+        if not target_data:
+            logger.warning("No target data returned from OpenTargets for %s", ensembl_id)
+            return []
+
+        assoc = target_data.get("associatedDiseases", {})
+        total = assoc.get("count", 0)
+        rows = assoc.get("rows", [])
+        logger.info(
+            "OpenTargets: %s (%s) — %d associated diseases (returned %d)",
+            target_data.get("approvedSymbol", "?"),
+            ensembl_id,
+            total,
+            len(rows),
+        )
+
+        diseases = []
+        for row in rows:
+            disease = row.get("disease", {})
+            ta_list = disease.get("therapeuticAreas", []) or []
+            ta_names = [ta.get("name", "") for ta in ta_list if ta.get("name")]
+            diseases.append({
+                "disease_id": disease.get("id", ""),
+                "disease_name": disease.get("name", ""),
+                "association_score": round(row.get("score", 0.0), 4),
+                "therapy_areas": ta_names,
+            })
+        return diseases
+
+    except requests.RequestException as e:
+        logger.error("OpenTargets API request failed: %s", e)
+        return []
+    except Exception as e:
+        logger.error("Unexpected error querying OpenTargets: %s", e)
+        return []
+
+
+def _build_opentargets_rows(
+    molecule: str,
+    company: str,
+    moa: str,
+    ensembl_id: str,
+    diseases: list[dict],
+) -> list[dict]:
+    """Convert OpenTargets disease associations into row dicts matching the
+    common format for excel_writer.py."""
+    rows = []
+    for d in diseases:
+        disease_name = d.get("disease_name", "")
+        if not disease_name:
+            continue
+        ta_names = d.get("therapy_areas", [])
+        ta_str = ", ".join(ta_names) if ta_names else ""
+        score = d.get("association_score", 0.0)
+
+        rows.append({
+            "molecule_name": molecule.title(),
+            "company_name": company,
+            "indication": disease_name,
+            "rationale": f"OpenTargets association (score: {score}) via MOA: {moa}",
+            "indication_type": "",
+            "therapy_area": ta_str,
+            "trial_title": f"OpenTargets: {ensembl_id}",
+            "trial_id": d.get("disease_id", ""),
+            "phase": "",
+            "source_url": f"https://platform.opentargets.org/target/{ensembl_id}",
+            "data_source": "OpenTargets",
+            "moa": moa,
+            "opentargets_score": score,
+        })
+    return rows
+
+
+def _run_opentargets_pipeline(molecule: str, company: str) -> tuple[list[dict], list[str]]:
+    """Full OpenTargets pipeline: fetch MOA → resolve Ensembl IDs → query diseases.
+
+    Returns (opentargets_rows, moa_list).
+    """
+    moas = _fetch_moa_from_bq(molecule)
+    if not moas:
+        logger.info("No MOA found for '%s' — skipping OpenTargets lookup", molecule)
+        return [], []
+
+    all_ot_rows = []
+    for moa in moas:
+        ensembl_id = _find_opentargets_target_id(moa)
+        if not ensembl_id:
+            continue
+        diseases = _query_opentargets_diseases(ensembl_id)
+        if diseases:
+            ot_rows = _build_opentargets_rows(molecule, company, moa, ensembl_id, diseases)
+            all_ot_rows.extend(ot_rows)
+            logger.info("OpenTargets: %d indication(s) from MOA '%s'", len(ot_rows), moa)
+
+    logger.info("OpenTargets total: %d indication(s) from %d MOA(s)", len(all_ot_rows), len(moas))
+    return all_ot_rows, moas
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  MODULE B ORCHESTRATION
+# ══════════════════════════════════════════════════════════════════════════
 def _innovator_research(molecule: str, company: str) -> list[dict]:
     queries = _build_innovator_queries(molecule, company)
     all_rows = []
@@ -1174,6 +1428,10 @@ def _innovator_research(molecule: str, company: str) -> list[dict]:
                 all_rows.extend(rows)
             except Exception as ex:
                 logger.error("%s: %s", source_type, ex)
+
+    # ── Search for approved secondary indications ─────────────────────
+    approved_secondary_rows = _search_approved_secondary_indications(molecule, company)
+    all_rows.extend(approved_secondary_rows)
 
     # ── Batch-standardise all raw indications in one Gemini + Search call ─
     raw_indications = [row["indication"] for row in all_rows if row["indication"]]
@@ -1203,7 +1461,9 @@ def _innovator_research(molecule: str, company: str) -> list[dict]:
         cls = classification_map.get((row["indication"] or "").lower(), {})
         row["indication_type"] = cls.get("indication_type", "")
         row["therapy_area"] = cls.get("therapy_area", "")
-        row["rationale"] = cls.get("rationale", "")
+        # Only overwrite rationale if it was empty
+        if not row.get("rationale"):
+            row["rationale"] = cls.get("rationale", "")
 
     # Override: Primary + non-Metabolic therapy area → Secondary
     for row in unique:
@@ -1238,10 +1498,26 @@ def _innovator_research(molecule: str, company: str) -> list[dict]:
     return unique
 
 
-def run_indication_research(molecule: str, company: str | None = None) -> list[dict]:
-    """Module B: research what the innovator company says about the drug."""
+def run_indication_research(
+    molecule: str, company: str | None = None
+) -> tuple[list[dict], list[dict], list[str]]:
+    """Module B: research what the innovator company says about the drug.
+
+    Returns
+    -------
+    tuple of (indication_rows, opentargets_rows, moa_list)
+        indication_rows: standard Drug Indication Research rows.
+        opentargets_rows: rows from OpenTargets disease associations.
+        moa_list: list of MOA strings found for this drug.
+    """
     logger.info("── Module B: Drug Indication Research ──")
     if not company:
         logger.info("Identifying innovator company")
         company = _identify_company(molecule) or ""
-    return _innovator_research(molecule, company)
+
+    indication_rows = _innovator_research(molecule, company)
+
+    # ── OpenTargets pipeline (MOA → target → diseases) ─────────────────
+    opentargets_rows, moa_list = _run_opentargets_pipeline(molecule, company)
+
+    return indication_rows, opentargets_rows, moa_list
