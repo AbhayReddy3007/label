@@ -11,6 +11,7 @@ Excel output, and handle the CLI. All of the actual work lives elsewhere:
     medical_potential/label_expansion/research_modules.py  Module A + Module B
     medical_potential/label_expansion/excel_writer.py      builds .xlsx workbook
     medical_potential/label_expansion/indication_standardizer.py  batch normalizer
+    medical_potential/label_expansion/scoring.py           maturity weight scoring
 
 Usage (run as package)
 ----------------------
@@ -34,6 +35,7 @@ from pathlib import Path
 import medical_potential.config as config
 from medical_potential.label_expansion import excel_writer
 from medical_potential.label_expansion import research_modules
+from medical_potential.label_expansion import scoring
 
 logger = logging.getLogger(__name__)
 
@@ -63,16 +65,29 @@ def run(drug: str | None = None, company: str | None = None) -> Path:
     logger.info("=" * 70)
 
     clinical_rows = research_modules.run_clinical_efficacy(drug)
-    indication_rows = research_modules.run_indication_research(drug, company or None)
+    indication_rows, opentargets_rows, moa_list = research_modules.run_indication_research(
+        drug, company or None
+    )
 
     if not clinical_rows and not indication_rows:
         logger.warning("No data found for '%s' from either Clinical Trials or Indication Research", drug)
 
-    out_file = excel_writer.write_excel(drug, clinical_rows, indication_rows)
+    out_file = excel_writer.write_excel(
+        drug,
+        clinical_rows,
+        indication_rows,
+        opentargets_rows=opentargets_rows,
+        moa_list=moa_list,
+    )
+
+    # ── Add Maturity Weight scoring sheet ──────────────────────────────
+    scoring.add_maturity_weight_sheet(out_file)
 
     logger.info("=" * 70)
-    logger.info("DONE — Clinical Efficacy: %d | Indication Research: %d | Combined: %d",
-                len(clinical_rows), len(indication_rows), len(clinical_rows) + len(indication_rows))
+    logger.info("DONE — Clinical Efficacy: %d | Indication Research: %d | "
+                "OpenTargets: %d | Combined: %d",
+                len(clinical_rows), len(indication_rows), len(opentargets_rows),
+                len(clinical_rows) + len(indication_rows) + len(opentargets_rows))
     logger.info("Output: %s", out_file)
     logger.info("=" * 70)
     return out_file
@@ -89,6 +104,8 @@ def _warn_if_missing_config() -> None:
         logger.warning("config.BQ_DATASET_ID is not set — the clinical-trials query will fail.")
     if not config.GCS_BUCKET:
         logger.warning("config.GCS_BUCKET is not set — checkpoints cannot be read/written to GCS.")
+    if not config.MOA_LOOKUP_TABLE:
+        logger.warning("config.MOA_LOOKUP_TABLE is not set — MOA lookup and OpenTargets integration will be skipped.")
 
 
 def main() -> None:
