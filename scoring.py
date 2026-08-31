@@ -28,9 +28,11 @@ and Module B need NOT be re-run), this script:
      research, not every disease OpenTargets happens to associate with
      the target.
   4. Rebuilds the "Maturity Weight Scoring" sheet from that new "All
-     Combined" data, appending Maturity_Weight (per row, from phase) and
+     Combined" data, appending Maturity_Weight (per row, from phase),
      Effective_Indications (drug-level — the sum of Maturity_Weight
-     across Secondary rows only, repeated on every row).
+     across Secondary rows only, repeated on every row), and Prior
+     (per row, from opentargets_score: >0.49→0.8, 0.1-0.49→0.4,
+     <0.1/unavailable→0.0).
 
 Every step is idempotent — sheets are updated/replaced in place, not
 appended to — and OpenTargets/Gemini lookups are cached in-memory per
@@ -500,6 +502,30 @@ def _phase_to_maturity_weight(phase) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  OPENTARGETS SCORE → PRIOR MAPPING
+# ══════════════════════════════════════════════════════════════════════════
+def _opentargets_score_to_prior(score) -> float:
+    """Map an opentargets_score value to its prior.
+
+    Rules:
+      - score > 0.49            → 0.8
+      - 0.1 <= score <= 0.49    → 0.4
+      - score < 0.1 or unavailable → 0.0
+    """
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if value > 0.49:
+        return 0.8
+    elif value >= 0.1:
+        return 0.4
+    else:
+        return 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  ALL COMBINED — rebuilt from Clinical Efficacy + Drug Indication
 #  Research only (the bulk "OpenTargets Indications" dump is NOT folded
 #  back in, so this sheet only ever reflects indications actually
@@ -534,12 +560,16 @@ def _rebuild_all_combined(wb, clinical_rows: list[dict], indication_rows: list[d
 # ══════════════════════════════════════════════════════════════════════════
 def add_maturity_weight_sheet(excel_path: str | Path) -> Path:
     """Open the label-expansion workbook, read the "All Combined" sheet,
-    and add a new "Maturity Weight Scoring" sheet with two columns
+    and add a new "Maturity Weight Scoring" sheet with three columns
     appended:
 
       - Maturity_Weight: per-row, derived from that row's phase.
       - Effective_Indications: drug-level (same value on every row) —
         the sum of Maturity_Weight across Secondary rows only.
+      - Prior: per-row, derived from that row's opentargets_score
+        (score > 0.49 → 0.8, 0.1–0.49 → 0.4, < 0.1 or unavailable → 0.0).
+        Since opentargets_score only exists on Secondary rows, Primary
+        rows always land in the "unavailable" → 0.0 case.
 
     Parameters
     ----------
@@ -642,7 +672,14 @@ def add_maturity_weight_sheet(excel_path: str | Path) -> Path:
     for row in data_rows:
         row["Effective_Indications"] = effective_indications
 
-    new_headers = headers + ["Maturity_Weight", "Effective_Indications"]
+    # ── Prior: per-row, derived from that row's opentargets_score. Since
+    # opentargets_score is only ever populated on Secondary rows (see the
+    # defensive cleanup above), Primary rows naturally fall into the
+    # "unavailable" → 0.0 case. ──────────────────────────────────────────
+    for row in data_rows:
+        row["Prior"] = _opentargets_score_to_prior(row.get("opentargets_score"))
+
+    new_headers = headers + ["Maturity_Weight", "Effective_Indications", "Prior"]
 
     target_sheet_name = "Maturity Weight Scoring"
     if target_sheet_name in wb.sheetnames:
@@ -670,7 +707,8 @@ def add_maturity_weight_sheet(excel_path: str | Path) -> Path:
     c.value = (
         f"Rows: {len(data_rows)}  |  Weight mapping: Preclinical=0.05, Ph1=0.1, Ph2=0.3, "
         f"Ph3=0.6, Approved=1.0  |  opentargets_score shown for Secondary indications only  |  "
-        f"Effective_Indications = sum of Maturity_Weight across Secondary rows (drug-level)"
+        f"Effective_Indications = sum of Maturity_Weight across Secondary rows (drug-level)  |  "
+        f"Prior: score>0.49→0.8, 0.1-0.49→0.4, <0.1/unavailable→0.0"
     )
     c.font = Font(name="Arial", italic=True, size=9, color="888888")
     c.alignment = Alignment(horizontal="left", vertical="center")
@@ -703,6 +741,10 @@ def add_maturity_weight_sheet(excel_path: str | Path) -> Path:
                 c.number_format = '0.00'
                 c.alignment = Alignment(horizontal="center", vertical="top")
 
+            if key == "Prior" and isinstance(val, (int, float)):
+                c.number_format = '0.00'
+                c.alignment = Alignment(horizontal="center", vertical="top")
+
             if key == "opentargets_score" and isinstance(val, (int, float)):
                 c.number_format = '0.0000'
 
@@ -717,7 +759,7 @@ def add_maturity_weight_sheet(excel_path: str | Path) -> Path:
         "TA-I": 36, "trial_title": 50, "trial_id": 18, "trial_size": 12,
         "phase": 10, "source_url": 40, "data_source": 16, "Ep": 8, "Et": 8,
         "moa": 28, "opentargets_score": 18, "Maturity_Weight": 16,
-        "Effective_Indications": 20,
+        "Effective_Indications": 20, "Prior": 12,
     }
     for i, h in enumerate(new_headers, 1):
         ws.column_dimensions[get_column_letter(i)].width = standard_widths.get(h, 16)
