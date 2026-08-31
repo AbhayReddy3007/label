@@ -542,7 +542,7 @@ def _fetch_clinical_trials(molecule_name: str) -> list[dict]:
     """
     table_id = f"{config.PROJECT_ID}.{config.BQ_DATASET_ID}.{config.CLINICAL_TRIALS_TABLE}"
     query = f"""
-        SELECT molecule_name, company_name, source_url, phase, trial_id
+        SELECT molecule_name, company_name, source_url, phase, trial_id, trial_size
         FROM `{table_id}`
         WHERE LOWER(molecule_name) = LOWER(@molecule)
     """
@@ -843,6 +843,7 @@ def _gemini_enrich_trials(rows: list[dict], molecule_name: str) -> list[dict]:
                 "rationale": "",
                 "trial_title": trial_title,
                 "trial_id": trial_id,
+                "trial_size": row.get("trial_size"),
                 "phase": phase,
                 "source_url": row.get("source_url"),
                 "data_source": "Clinical Trials",
@@ -868,6 +869,7 @@ def _gemini_enrich_trials(rows: list[dict], molecule_name: str) -> list[dict]:
                 "rationale": c.get("rationale", ""),
                 "trial_title": trial_title,
                 "trial_id": trial_id,
+                "trial_size": row.get("trial_size"),
                 "phase": phase,
                 "source_url": row.get("source_url"),
                 "data_source": "Clinical Trials",
