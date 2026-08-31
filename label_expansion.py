@@ -11,7 +11,9 @@ Excel output, and handle the CLI. All of the actual work lives elsewhere:
     medical_potential/label_expansion/research_modules.py  Module A + Module B
     medical_potential/label_expansion/excel_writer.py      builds .xlsx workbook
     medical_potential/label_expansion/indication_standardizer.py  batch normalizer
-    medical_potential/label_expansion/scoring.py           maturity weight scoring
+    medical_potential/label_expansion/scoring.py           OpenTargets scoring
+                                                            (Secondary rows only) +
+                                                            maturity weight scoring
 
 Usage (run as package)
 ----------------------
@@ -65,34 +67,40 @@ def run(drug: str | None = None, company: str | None = None) -> Path:
     logger.info("=" * 70)
 
     clinical_rows = research_modules.run_clinical_efficacy(drug)
-    indication_rows, opentargets_rows, moa_list = research_modules.run_indication_research(
+    indication_rows, moa_list = research_modules.run_indication_research(
         drug, company or None
     )
 
+    # ── Stamp MOA onto clinical rows too, so scoring.py can resolve an
+    # OpenTargets target for any Secondary clinical-trial rows later. ───
+    if moa_list and clinical_rows:
+        moa_str = "; ".join(moa_list)
+        for row in clinical_rows:
+            row.setdefault("moa", "")
+            if not row["moa"]:
+                row["moa"] = moa_str
+
     if not clinical_rows and not indication_rows:
         logger.warning("No data found for '%s' from either Clinical Trials or Indication Research", drug)
-
-    # ── Map OpenTargets association scores onto clinical rows too ──────
-    if opentargets_rows and clinical_rows:
-        logger.info("Mapping OpenTargets association scores onto clinical efficacy rows")
-        research_modules._apply_opentargets_scores(clinical_rows, opentargets_rows, moa_list)
 
     out_file = excel_writer.write_excel(
         drug,
         clinical_rows,
         indication_rows,
-        opentargets_rows=opentargets_rows,
         moa_list=moa_list,
     )
 
-    # ── Add Maturity Weight scoring sheet ──────────────────────────────
-    scoring.add_maturity_weight_sheet(out_file)
+    # ── OpenTargets scoring (Secondary rows only) + Maturity Weight ─────
+    # This is the same standalone step documented in scoring.py — it can
+    # also be re-run on its own later, on this same output file, without
+    # repeating Module A / Module B.
+    scoring.run_scoring(out_file)
 
     logger.info("=" * 70)
     logger.info("DONE — Clinical Efficacy: %d | Indication Research: %d | "
-                "OpenTargets: %d | Combined: %d",
-                len(clinical_rows), len(indication_rows), len(opentargets_rows),
-                len(clinical_rows) + len(indication_rows) + len(opentargets_rows))
+                "Combined: %d",
+                len(clinical_rows), len(indication_rows),
+                len(clinical_rows) + len(indication_rows))
     logger.info("Output: %s", out_file)
     logger.info("=" * 70)
     return out_file
