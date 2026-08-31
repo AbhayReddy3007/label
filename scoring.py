@@ -230,8 +230,8 @@ def add_maturity_weight_sheet(excel_path: str | Path) -> Path:
     standard_widths = {
         "molecule_name": 18, "company_name": 22, "indication": 28,
         "rationale": 40, "indication_type": 16, "therapy_area": 18,
-        "TA-I": 36, "trial_title": 50, "trial_id": 18, "phase": 10,
-        "source_url": 40, "data_source": 16, "Ep": 8, "Et": 8,
+        "TA-I": 36, "trial_title": 50, "trial_id": 18, "trial_size": 12,
+        "phase": 10, "source_url": 40, "data_source": 16, "Ep": 8, "Et": 8,
         "moa": 28, "opentargets_score": 18, "Maturity_Weight": 16,
     }
     for i, h in enumerate(new_headers, 1):
