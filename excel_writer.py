@@ -30,9 +30,10 @@ logger = logging.getLogger(__name__)
 HEADERS = [
     "molecule_name", "company_name", "indication", "rationale",
     "indication_type", "therapy_area", "TA-I", "trial_title", "trial_id",
-    "phase", "source_url", "data_source", "Ep", "Et", "moa", "opentargets_score",
+    "trial_size", "phase", "source_url", "data_source", "Ep", "Et", "moa",
+    "opentargets_score",
 ]
-COL_WIDTHS = [18, 22, 28, 40, 16, 18, 36, 50, 18, 10, 40, 16, 8, 8, 28, 18]
+COL_WIDTHS = [18, 22, 28, 40, 16, 18, 36, 50, 18, 12, 10, 40, 16, 8, 8, 28, 18]
 
 # Headers for the dedicated OpenTargets sheet
 OT_HEADERS = [
@@ -185,6 +186,7 @@ def write_excel(
     for row in clinical_rows + indication_rows:
         row.setdefault("moa", "")
         row.setdefault("opentargets_score", "")
+        row.setdefault("trial_size", "")
 
     output_dir = Path(config.OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
