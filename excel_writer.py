@@ -1,11 +1,19 @@
 """Writes the single-drug label-expansion workbook.
 
 Takes the row lists produced by `research_modules.py` (Clinical Efficacy
-rows, Drug Indication Research rows, OpenTargets rows) and writes them to
-one .xlsx with five sheets: Clinical Efficacy, Drug Indication Research,
-OpenTargets Indications, All Combined, and Summary. This module knows
-nothing about BigQuery, GCS, or Gemini — it only formats rows that are
-already plain dicts.
+rows and Drug Indication Research rows) and writes them to one .xlsx with
+four sheets: Clinical Efficacy, Drug Indication Research, All Combined,
+and Summary. This module knows nothing about BigQuery, GCS, or Gemini —
+it only formats rows that are already plain dicts.
+
+Note: OpenTargets scores are NOT populated at this stage. They're added
+afterward, standalone, by scoring.py — which resolves each row's MOA to
+an Ensembl target ID and looks up only Secondary-indication rows one at a
+time, rather than bulk-fetching every disease associated with a target.
+Because of that, this module no longer writes a dedicated "OpenTargets
+Indications" sheet (there's no longer a bulk dump of disease associations
+to put in it) — every row's opentargets_score lives directly on its
+Clinical Efficacy / Drug Indication Research / All Combined row instead.
 """
 
 from __future__ import annotations
@@ -34,14 +42,6 @@ HEADERS = [
     "opentargets_score",
 ]
 COL_WIDTHS = [18, 22, 28, 40, 16, 18, 36, 50, 18, 12, 10, 40, 16, 8, 8, 28, 18]
-
-# Headers for the dedicated OpenTargets sheet
-OT_HEADERS = [
-    "molecule_name", "company_name", "indication", "rationale",
-    "therapy_area", "moa", "opentargets_score",
-    "trial_title", "trial_id", "source_url", "data_source",
-]
-OT_COL_WIDTHS = [18, 22, 28, 40, 24, 28, 18, 50, 18, 40, 16]
 
 
 def _thin_border() -> Border:
@@ -170,16 +170,18 @@ def write_excel(
     molecule: str,
     clinical_rows: list[dict],
     indication_rows: list[dict],
-    opentargets_rows: list[dict] | None = None,
     moa_list: list[str] | None = None,
 ) -> Path:
     """Write the single-drug workbook: Clinical Efficacy, Drug Indication
-    Research, OpenTargets Indications, All Combined, and Summary sheets.
+    Research, All Combined, and Summary sheets.
+
+    OpenTargets scores are NOT fetched here — every row's
+    opentargets_score starts blank and is populated afterward, standalone,
+    by scoring.py (see that module's docstring for why).
 
     Writes directly into config.OUTPUT_DIR (created once, reused across
     runs) as `<drug>_label_expansion.xlsx` — no per-run output folder.
     """
-    opentargets_rows = opentargets_rows or []
     moa_list = moa_list or []
 
     # Ensure moa and opentargets_score keys exist on all rows
@@ -204,13 +206,8 @@ def write_excel(
     ws2 = wb.create_sheet("Drug Indication Research")
     _write_standard_sheet(ws2, indication_rows, molecule, "Drug Indication Research")
 
-    # ── Sheet 3: OpenTargets Indications ──────────────────────────────
-    ws3 = wb.create_sheet("OpenTargets Indications")
-    _write_standard_sheet(ws3, opentargets_rows, molecule, "OpenTargets Indications",
-                          headers=OT_HEADERS, col_widths=OT_COL_WIDTHS)
-
-    # ── Sheet 4: All Combined ─────────────────────────────────────────
-    combined = clinical_rows + indication_rows + opentargets_rows
+    # ── Sheet 3: All Combined ─────────────────────────────────────────
+    combined = clinical_rows + indication_rows
 
     # Et in "All Combined" = highest Et across both modules
     et_values = [r.get("Et") for r in combined if r.get("Et")]
@@ -223,10 +220,10 @@ def write_excel(
     for row in combined:
         row["Et"] = max_et
 
-    ws4 = wb.create_sheet("All Combined")
-    _write_standard_sheet(ws4, combined, molecule, "All Sources Combined")
+    ws3 = wb.create_sheet("All Combined")
+    _write_standard_sheet(ws3, combined, molecule, "All Sources Combined")
 
-    # ── Sheet 5: Summary ──────────────────────────────────────────────
+    # ── Sheet 4: Summary ──────────────────────────────────────────────
     _write_summary_sheet(wb, combined, molecule.title(), moa_list=moa_list)
 
     wb.save(str(out_file))
