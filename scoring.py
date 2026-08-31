@@ -28,7 +28,9 @@ and Module B need NOT be re-run), this script:
      research, not every disease OpenTargets happens to associate with
      the target.
   4. Rebuilds the "Maturity Weight Scoring" sheet from that new "All
-     Combined" data, appending the Maturity_Weight column as before.
+     Combined" data, appending Maturity_Weight (per row, from phase) and
+     Effective_Indications (drug-level — the sum of Maturity_Weight
+     across Secondary rows only, repeated on every row).
 
 Every step is idempotent — sheets are updated/replaced in place, not
 appended to — and OpenTargets/Gemini lookups are cached in-memory per
@@ -532,8 +534,12 @@ def _rebuild_all_combined(wb, clinical_rows: list[dict], indication_rows: list[d
 # ══════════════════════════════════════════════════════════════════════════
 def add_maturity_weight_sheet(excel_path: str | Path) -> Path:
     """Open the label-expansion workbook, read the "All Combined" sheet,
-    and add a new "Maturity Weight Scoring" sheet with a Maturity_Weight
-    column appended.
+    and add a new "Maturity Weight Scoring" sheet with two columns
+    appended:
+
+      - Maturity_Weight: per-row, derived from that row's phase.
+      - Effective_Indications: drug-level (same value on every row) —
+        the sum of Maturity_Weight across Secondary rows only.
 
     Parameters
     ----------
@@ -617,7 +623,26 @@ def add_maturity_weight_sheet(excel_path: str | Path) -> Path:
             source_sheet_name,
         )
 
-    new_headers = headers + ["Maturity_Weight"]
+    # ── Effective Indications: sum of Maturity_Weight across Secondary
+    # rows only. This is a drug-level figure (like Et), so the same value
+    # is repeated on every row rather than being row-specific. ──────────
+    if indication_type_col:
+        effective_indications = sum(
+            row["Maturity_Weight"]
+            for row in data_rows
+            if str(row.get(indication_type_col, "") or "").strip().lower() == "secondary"
+        )
+    else:
+        logger.warning(
+            "No 'indication_type' column found in '%s' — Effective_Indications will be 0 for all rows",
+            source_sheet_name,
+        )
+        effective_indications = 0.0
+    effective_indications = round(effective_indications, 2)
+    for row in data_rows:
+        row["Effective_Indications"] = effective_indications
+
+    new_headers = headers + ["Maturity_Weight", "Effective_Indications"]
 
     target_sheet_name = "Maturity Weight Scoring"
     if target_sheet_name in wb.sheetnames:
@@ -644,7 +669,8 @@ def add_maturity_weight_sheet(excel_path: str | Path) -> Path:
     c = ws["A2"]
     c.value = (
         f"Rows: {len(data_rows)}  |  Weight mapping: Preclinical=0.05, Ph1=0.1, Ph2=0.3, "
-        f"Ph3=0.6, Approved=1.0  |  opentargets_score shown for Secondary indications only"
+        f"Ph3=0.6, Approved=1.0  |  opentargets_score shown for Secondary indications only  |  "
+        f"Effective_Indications = sum of Maturity_Weight across Secondary rows (drug-level)"
     )
     c.font = Font(name="Arial", italic=True, size=9, color="888888")
     c.alignment = Alignment(horizontal="left", vertical="center")
@@ -673,6 +699,10 @@ def add_maturity_weight_sheet(excel_path: str | Path) -> Path:
                 c.number_format = '0.00'
                 c.alignment = Alignment(horizontal="center", vertical="top")
 
+            if key == "Effective_Indications" and isinstance(val, (int, float)):
+                c.number_format = '0.00'
+                c.alignment = Alignment(horizontal="center", vertical="top")
+
             if key == "opentargets_score" and isinstance(val, (int, float)):
                 c.number_format = '0.0000'
 
@@ -687,6 +717,7 @@ def add_maturity_weight_sheet(excel_path: str | Path) -> Path:
         "TA-I": 36, "trial_title": 50, "trial_id": 18, "trial_size": 12,
         "phase": 10, "source_url": 40, "data_source": 16, "Ep": 8, "Et": 8,
         "moa": 28, "opentargets_score": 18, "Maturity_Weight": 16,
+        "Effective_Indications": 20,
     }
     for i, h in enumerate(new_headers, 1):
         ws.column_dimensions[get_column_letter(i)].width = standard_widths.get(h, 16)
