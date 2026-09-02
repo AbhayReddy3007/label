@@ -8,31 +8,43 @@ and Module B need NOT be re-run), this script:
 
   1. Reads "Clinical Efficacy" and "Drug Indication Research" directly
      from the workbook.
-  2. For every row whose indication_type is "Secondary", resolves the
-     row's MOA to an Ensembl target ID (Gemini + Search, cached per MOA)
-     and looks up ONLY that one indication against the OpenTargets
-     Platform:
-       - a single disease `search` call to align the indication name to
-         OpenTargets' canonical disease name and get its EFO ID, then
-       - a single target-disease association query filtered to that
-         exact EFO ID (`Bs: [efoId]`) to fetch just that one score.
+  2. Resolves the drug's MOA(s) to Ensembl target ID(s) ONCE, at drug
+     level — not per row. The "moa" field can contain several MOAs,
+     separated by ";", and it's stamped identically onto every row for a
+     single-drug workbook, so it only needs resolving once:
+       a. Gemini + Search first finds the OpenTargets-equivalent target
+          name for each MOA.
+       b. The OpenTargets search API resolves that name to its real
+          Ensembl ID (never trusting an LLM-generated ID directly).
+  3. For every row whose indication_type is "Secondary":
+       a. Resolves the row's indication to its OpenTargets-equivalent
+          disease name — again in two steps: Gemini + Search first
+          (handles abbreviations/synonyms), then the OpenTargets
+          `search` API confirms the canonical name and returns its EFO
+          ID. The indication cell is renamed to this canonical name.
+       b. Queries the OpenTargets target-disease association score
+          (`associatedDiseases(Bs: [efoId])`, filtered to that one
+          disease) for every one of the drug's resolved Ensembl targets
+          (from step 2), and keeps the HIGHEST score across them — this
+          is the drug's best-supported target for that indication.
      This never bulk-fetches "all associated diseases" for a target —
      only the specific indications already present in our own data are
      looked up. Primary rows are left completely untouched: no
-     OpenTargets call is made for them and any pre-existing
+     OpenTargets or Gemini call is made for them, and any pre-existing
      opentargets_score on a non-Secondary row is cleared.
-  3. Rebuilds "All Combined" from the (now updated) Clinical Efficacy +
+  4. Rebuilds "All Combined" from the (now updated) Clinical Efficacy +
      Drug Indication Research rows only — the old bulk "OpenTargets
      Indications" dump is no longer folded in, so this sheet only ever
      contains indications actually observed in trials / innovator
      research, not every disease OpenTargets happens to associate with
      the target.
-  4. Rebuilds the "Maturity Weight Scoring" sheet from that new "All
-     Combined" data, appending Maturity_Weight (per row, from phase),
-     Effective_Indications (drug-level — the sum of Maturity_Weight
-     across Secondary rows only, repeated on every row), and Prior
-     (per row, from opentargets_score: >0.49→0.8, 0.1-0.49→0.4,
-     <0.1/unavailable→0.0).
+  5. Rebuilds the "Maturity Weight Scoring" sheet from that new "All
+     Combined" data — keeping Secondary rows ONLY (Primary rows are
+     dropped from this sheet) — and appending Maturity_Weight (per row,
+     from phase), Effective_Indications (drug-level — the sum of
+     Maturity_Weight across all rows in the sheet, repeated on every
+     row), and Prior (per row, from opentargets_score: >0.49→0.8,
+     0.1-0.49→0.4, <0.1/unavailable→0.0).
 
 Every step is idempotent — sheets are updated/replaced in place, not
 appended to — and OpenTargets/Gemini lookups are cached in-memory per
@@ -244,40 +256,123 @@ def _extract_json(text: str) -> dict | list:
 OPENTARGETS_GRAPHQL_URL = "https://api.platform.opentargets.org/api/v4/graphql"
 
 
-def _resolve_ensembl_id_for_moa(moa: str) -> str | None:
-    """Use Gemini + Search to find the Ensembl gene ID (ENSG...) for a
-    given Mechanism of Action target name."""
+def _resolve_target_name_via_gemini(moa: str) -> str | None:
+    """Step 1 of MOA resolution: use Gemini + Search to find the
+    equivalent target/gene name — as named on the OpenTargets Platform —
+    for a given Mechanism of Action string. Returns a name only (e.g. an
+    HGNC gene symbol like "GLP1R"), not an ID; the ID itself is resolved
+    afterward via the OpenTargets search API so we never trust an
+    LLM-generated Ensembl ID directly."""
     prompt = f"""
 You are a bioinformatics expert.
 
 Mechanism of Action (MOA): "{moa}"
 
-From this MOA, identify the primary molecular target (protein / gene).
-Then find its Ensembl Gene ID (format: ENSG followed by 11 digits,
-e.g. ENSG00000169083) which is used on the OpenTargets Platform
-(https://platform.opentargets.org/).
+From this MOA, identify the primary molecular target (protein / gene),
+and give its name using the naming convention used on the OpenTargets
+Platform (https://platform.opentargets.org/) — typically the HGNC gene
+symbol (e.g. "GLP1R", "EGFR", "TNF").
 
-Search the web to find the correct Ensembl Gene ID for this target.
+Search the web to confirm the correct target name.
 
 Return ONLY valid JSON — no markdown, no explanation:
-{{"target_name": "<gene/protein name>", "ensembl_id": "<ENSG...>"}}
-If you cannot determine the Ensembl ID, return:
-{{"target_name": "<gene/protein name>", "ensembl_id": ""}}
+{{"target_name": "<gene/protein symbol>"}}
+If you cannot determine it, return:
+{{"target_name": ""}}
 """
     try:
         text = _gemini_generate(prompt, system_instruction="Return ONLY valid JSON.", use_search=True)
         if not text:
             return None
         data = _extract_json(text)
-        ensembl_id = (data.get("ensembl_id") or "").strip()
         target_name = (data.get("target_name") or "").strip()
-        if ensembl_id and ensembl_id.startswith("ENSG"):
-            logger.info("MOA '%s' → target '%s' → Ensembl ID: %s", moa, target_name, ensembl_id)
-            return ensembl_id
-        logger.warning("Could not resolve Ensembl ID for MOA '%s' (target: '%s')", moa, target_name)
-        return None
+        return target_name or None
     except Exception as e:
-        logger.warning("Failed to resolve Ensembl ID for MOA '%s': %s", moa, e)
+        logger.warning("Failed to resolve OpenTargets target name for MOA '%s': %s", moa, e)
+        return None
+
+
+def _search_opentargets_target(name: str) -> tuple[str, str] | None:
+    """Look up a target name against OpenTargets' search endpoint.
+    Returns (ensembl_id, canonical_target_name) for the best hit, or None."""
+    query_string = """
+    query targetSearch($q: String!) {
+      search(queryString: $q, entityNames: ["target"], page: {index: 0, size: 5}) {
+        hits { id name entity }
+      }
+    }
+    """
+    try:
+        resp = requests.post(
+            OPENTARGETS_GRAPHQL_URL,
+            json={"query": query_string, "variables": {"q": name}},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        hits = resp.json().get("data", {}).get("search", {}).get("hits", []) or []
+        for h in hits:
+            if h.get("entity") == "target" and h.get("id") and h.get("name"):
+                return h["id"], h["name"]
+        logger.info("No OpenTargets target match for '%s'", name)
+        return None
+    except requests.RequestException as e:
+        logger.warning("OpenTargets target search failed for '%s': %s", name, e)
+        return None
+
+
+def _resolve_ensembl_id_for_moa(moa: str) -> str | None:
+    """Full MOA → Ensembl ID resolution, in two steps:
+      1. Gemini + Search finds the OpenTargets-equivalent target name.
+      2. The OpenTargets search API resolves that name to its real
+         Ensembl gene ID (and canonical name), so we never rely on an
+         LLM-generated ID directly.
+    """
+    target_name = _resolve_target_name_via_gemini(moa)
+    if not target_name:
+        logger.warning("Could not resolve an OpenTargets target name for MOA '%s'", moa)
+        return None
+
+    hit = _search_opentargets_target(target_name)
+    if not hit:
+        logger.warning("No OpenTargets target match for '%s' (from MOA '%s')", target_name, moa)
+        return None
+
+    ensembl_id, canonical_name = hit
+    logger.info("MOA '%s' → target '%s' → Ensembl ID: %s", moa, canonical_name, ensembl_id)
+    return ensembl_id
+
+
+def _resolve_indication_name_via_gemini(indication: str) -> str | None:
+    """Use Gemini + Search to find the equivalent disease name — as named
+    on the OpenTargets Platform (EFO naming conventions) — for a given
+    indication string. This runs BEFORE the OpenTargets disease search,
+    so e.g. an abbreviation or a trial-specific phrasing gets normalized
+    to something OpenTargets is more likely to recognize."""
+    prompt = f"""
+You are a medical terminology expert.
+
+Indication: "{indication}"
+
+Identify the equivalent disease/phenotype name as used on the OpenTargets
+Platform (https://platform.opentargets.org/), which follows EFO
+(Experimental Factor Ontology) naming conventions.
+
+Search the web if needed to confirm the correct name.
+
+Return ONLY valid JSON — no markdown, no explanation:
+{{"disease_name": "<EFO-style disease name>"}}
+If you cannot determine it, return:
+{{"disease_name": ""}}
+"""
+    try:
+        text = _gemini_generate(prompt, system_instruction="Return ONLY valid JSON.", use_search=True)
+        if not text:
+            return None
+        data = _extract_json(text)
+        disease_name = (data.get("disease_name") or "").strip()
+        return disease_name or None
+    except Exception as e:
+        logger.warning("Failed to resolve OpenTargets disease name for indication '%s': %s", indication, e)
         return None
 
 
@@ -372,22 +467,58 @@ def _read_sheet_rows(ws) -> tuple[list[str], list[dict], dict[str, int]]:
     return headers, rows, header_to_col
 
 
+def _resolve_drug_ensembl_ids(moa_field: str, ensembl_cache: dict[str, str | None]) -> list[str]:
+    """Resolve every MOA listed for the drug (the "moa" field can contain
+    several, separated by ";") to its Ensembl target ID — ONCE, at drug
+    level. MOA is stamped identically onto every row of a single-drug
+    workbook, so there is no need to re-resolve it per row. Returns a
+    deduped list of Ensembl IDs (empty if none resolved)."""
+    ensembl_ids: list[str] = []
+    for moa in [m.strip() for m in moa_field.split(";") if m.strip()]:
+        if moa not in ensembl_cache:
+            ensembl_cache[moa] = _resolve_ensembl_id_for_moa(moa)
+        eid = ensembl_cache[moa]
+        if eid and eid not in ensembl_ids:
+            ensembl_ids.append(eid)
+    return ensembl_ids
+
+
+def _get_drug_moa_field(wb) -> str:
+    """Return the drug's "moa" field, read from the first row that has
+    one across "Clinical Efficacy" and "Drug Indication Research". MOA is
+    a drug-level property (stamped identically onto every row by
+    research_modules.py), so any single row's value represents the whole
+    drug — there's no need to scan every row."""
+    for sheet_name in ("Clinical Efficacy", "Drug Indication Research"):
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        _headers, rows, _header_to_col = _read_sheet_rows(ws)
+        for row in rows:
+            moa = str(row.get("moa", "") or "").strip()
+            if moa:
+                return moa
+    return ""
+
+
 def _update_secondary_rows_with_opentargets(
     ws,
     header_to_col: dict[str, int],
     rows: list[dict],
-    ensembl_cache: dict[str, str | None],
+    ensembl_ids: list[str],
     disease_cache: dict[str, tuple[str, str] | None],
 ) -> None:
-    """Mutate *ws* in place: for Secondary rows, resolve MOA → Ensembl ID,
-    look up that one indication on OpenTargets, align its name, and stamp
-    opentargets_score. For every other row, clear any stale
+    """Mutate *ws* in place: for Secondary rows, resolve the indication's
+    OpenTargets-equivalent name (Gemini + Search, then confirmed via the
+    OpenTargets search API), align the indication name, and stamp
+    opentargets_score with the highest association score across the
+    drug's *ensembl_ids* (resolved once, at drug level, by the caller —
+    see _resolve_drug_ensembl_ids). For every other row, clear any stale
     opentargets_score. Cell writes are targeted (only the indication and
     opentargets_score columns) so all other formatting is untouched."""
     ind_col = header_to_col.get("indication")
     itype_col = header_to_col.get("indication_type")
     score_col = header_to_col.get("opentargets_score")
-    moa_col = header_to_col.get("moa")
 
     if not (ind_col and itype_col and score_col):
         logger.warning("Sheet is missing indication/indication_type/opentargets_score columns — skipping")
@@ -408,32 +539,36 @@ def _update_secondary_rows_with_opentargets(
         if not indication or indication.lower() == "no indication found":
             continue
 
-        moa_field = str(row.get("moa", "") or "").strip()
-        if not moa_field:
-            logger.info("Secondary row '%s' has no MOA — cannot resolve an OpenTargets target", indication)
+        if not ensembl_ids:
+            logger.info(
+                "Secondary row '%s' has no resolvable OpenTargets target for this drug — skipping",
+                indication,
+            )
             continue
 
-        ensembl_id = None
-        for moa in [m.strip() for m in moa_field.split(";") if m.strip()]:
-            if moa not in ensembl_cache:
-                ensembl_cache[moa] = _resolve_ensembl_id_for_moa(moa)
-            ensembl_id = ensembl_cache[moa]
-            if ensembl_id:
-                break
-        if not ensembl_id:
-            continue
-
+        # Resolve the indication's OpenTargets-equivalent name via
+        # Gemini + Search first, then confirm/locate it (and its EFO ID)
+        # through the OpenTargets search API.
         cache_key = indication.lower()
         if cache_key not in disease_cache:
-            disease_cache[cache_key] = _search_opentargets_disease(indication)
+            gemini_name = _resolve_indication_name_via_gemini(indication)
+            disease_cache[cache_key] = _search_opentargets_disease(gemini_name or indication)
         hit = disease_cache[cache_key]
         if not hit:
             continue
         efo_id, ot_name = hit
 
-        score = _get_target_disease_score(ensembl_id, efo_id)
-        if score is None:
+        # Query the association score against every resolved drug-level
+        # target and keep the highest one — this is the drug's
+        # best-supported target for this indication.
+        best_score = None
+        for ensembl_id in ensembl_ids:
+            score = _get_target_disease_score(ensembl_id, efo_id)
+            if score is not None and (best_score is None or score > best_score):
+                best_score = score
+        if best_score is None:
             continue
+        score = best_score
 
         # Align the indication name to OpenTargets' canonical name.
         ws.cell(row=r, column=ind_col, value=ot_name)
@@ -443,20 +578,18 @@ def _update_secondary_rows_with_opentargets(
         score_cell.number_format = '0.0000'
         row["opentargets_score"] = score
 
-        if moa_col and not row.get("moa"):
-            ws.cell(row=r, column=moa_col, value=moa_field)
 
-
-def _process_sheet(wb, sheet_name: str, ensembl_cache: dict, disease_cache: dict) -> list[dict]:
+def _process_sheet(wb, sheet_name: str, ensembl_ids: list[str], disease_cache: dict) -> list[dict]:
     """Read *sheet_name*, apply targeted OpenTargets scoring to its
-    Secondary rows in place, and return the resulting row dicts (ready
-    for use elsewhere, e.g. rebuilding "All Combined")."""
+    Secondary rows in place (using the drug-level *ensembl_ids* resolved
+    once by the caller), and return the resulting row dicts (ready for
+    use elsewhere, e.g. rebuilding "All Combined")."""
     if sheet_name not in wb.sheetnames:
         logger.warning("Sheet '%s' not found in workbook — skipping", sheet_name)
         return []
     ws = wb[sheet_name]
     _headers, rows, header_to_col = _read_sheet_rows(ws)
-    _update_secondary_rows_with_opentargets(ws, header_to_col, rows, ensembl_cache, disease_cache)
+    _update_secondary_rows_with_opentargets(ws, header_to_col, rows, ensembl_ids, disease_cache)
     for row in rows:
         row.pop("_row_number", None)
     return rows
@@ -560,16 +693,15 @@ def _rebuild_all_combined(wb, clinical_rows: list[dict], indication_rows: list[d
 # ══════════════════════════════════════════════════════════════════════════
 def add_maturity_weight_sheet(excel_path: str | Path) -> Path:
     """Open the label-expansion workbook, read the "All Combined" sheet,
-    and add a new "Maturity Weight Scoring" sheet with three columns
-    appended:
+    keep Secondary-indication rows only, and add a new "Maturity Weight
+    Scoring" sheet with three columns appended:
 
       - Maturity_Weight: per-row, derived from that row's phase.
       - Effective_Indications: drug-level (same value on every row) —
-        the sum of Maturity_Weight across Secondary rows only.
+        the sum of Maturity_Weight across all rows in this sheet (all of
+        which are Secondary, since Primary rows are dropped).
       - Prior: per-row, derived from that row's opentargets_score
         (score > 0.49 → 0.8, 0.1–0.49 → 0.4, < 0.1 or unavailable → 0.0).
-        Since opentargets_score only exists on Secondary rows, Primary
-        rows always land in the "unavailable" → 0.0 case.
 
     Parameters
     ----------
@@ -613,6 +745,35 @@ def add_maturity_weight_sheet(excel_path: str | Path) -> Path:
         logger.warning("No data rows found in '%s' — skipping maturity weight sheet", source_sheet_name)
         return excel_path
 
+    # ── Keep Secondary rows only. The Maturity Weight Scoring sheet is
+    # scoped to Secondary indications — Primary rows are dropped here,
+    # before any of the downstream weight/score calculations run. ───────
+    indication_type_col = None
+    for h in headers:
+        if h.lower() == "indication_type":
+            indication_type_col = h
+            break
+
+    if indication_type_col:
+        before = len(data_rows)
+        data_rows = [
+            r for r in data_rows
+            if str(r.get(indication_type_col, "") or "").strip().lower() == "secondary"
+        ]
+        logger.info(
+            "Maturity Weight Scoring: kept %d Secondary row(s) out of %d",
+            len(data_rows), before,
+        )
+    else:
+        logger.warning(
+            "No 'indication_type' column found in '%s' — cannot filter to Secondary rows; "
+            "including all rows", source_sheet_name,
+        )
+
+    if not data_rows:
+        logger.warning("No Secondary rows found — skipping maturity weight sheet")
+        return excel_path
+
     phase_col = None
     for h in headers:
         if h.lower() == "phase":
@@ -626,49 +787,12 @@ def add_maturity_weight_sheet(excel_path: str | Path) -> Path:
         phase_val = row.get(phase_col, "")
         row["Maturity_Weight"] = _phase_to_maturity_weight(phase_val)
 
-    # ── Defensive cleanup: opentargets_score should only ever be present
-    # on Secondary rows. It should already be true by construction (see
-    # _update_secondary_rows_with_opentargets), but this guards against a
-    # workbook that was hand-edited or produced by an older run. ─────────
-    indication_type_col = None
-    for h in headers:
-        if h.lower() == "indication_type":
-            indication_type_col = h
-            break
-
-    if indication_type_col and "opentargets_score" in headers:
-        cleared = 0
-        for row in data_rows:
-            itype = str(row.get(indication_type_col, "") or "").strip().lower()
-            if itype != "secondary":
-                row["opentargets_score"] = ""
-                cleared += 1
-        logger.info(
-            "Cleared opentargets_score on %d non-Secondary row(s); kept it only for Secondary rows",
-            cleared,
-        )
-    elif not indication_type_col:
-        logger.warning(
-            "No 'indication_type' column found in '%s' — opentargets_score left as-is for all rows",
-            source_sheet_name,
-        )
-
-    # ── Effective Indications: sum of Maturity_Weight across Secondary
-    # rows only. This is a drug-level figure (like Et), so the same value
-    # is repeated on every row rather than being row-specific. ──────────
-    if indication_type_col:
-        effective_indications = sum(
-            row["Maturity_Weight"]
-            for row in data_rows
-            if str(row.get(indication_type_col, "") or "").strip().lower() == "secondary"
-        )
-    else:
-        logger.warning(
-            "No 'indication_type' column found in '%s' — Effective_Indications will be 0 for all rows",
-            source_sheet_name,
-        )
-        effective_indications = 0.0
-    effective_indications = round(effective_indications, 2)
+    # ── Effective Indications: sum of Maturity_Weight. Every row here is
+    # already Secondary (Primary rows were dropped above), so this is
+    # simply the sum across all remaining rows. This is a drug-level
+    # figure (like Et), so the same value is repeated on every row rather
+    # than being row-specific. ───────────────────────────────────────────
+    effective_indications = round(sum(row["Maturity_Weight"] for row in data_rows), 2)
     for row in data_rows:
         row["Effective_Indications"] = effective_indications
 
@@ -705,9 +829,9 @@ def add_maturity_weight_sheet(excel_path: str | Path) -> Path:
     ws.merge_cells(f"A2:{get_column_letter(ncols)}2")
     c = ws["A2"]
     c.value = (
-        f"Rows: {len(data_rows)}  |  Weight mapping: Preclinical=0.05, Ph1=0.1, Ph2=0.3, "
-        f"Ph3=0.6, Approved=1.0  |  opentargets_score shown for Secondary indications only  |  "
-        f"Effective_Indications = sum of Maturity_Weight across Secondary rows (drug-level)  |  "
+        f"Secondary indications only ({len(data_rows)} rows)  |  Weight mapping: Preclinical=0.05, "
+        f"Ph1=0.1, Ph2=0.3, Ph3=0.6, Approved=1.0  |  "
+        f"Effective_Indications = sum of Maturity_Weight across all rows in this sheet (drug-level)  |  "
         f"Prior: score>0.49→0.8, 0.1-0.49→0.4, <0.1/unavailable→0.0"
     )
     c.font = Font(name="Arial", italic=True, size=9, color="888888")
@@ -777,10 +901,13 @@ def run_scoring(excel_path: str | Path) -> Path:
     already-generated label-expansion workbook — it never touches
     BigQuery, GCS, or re-runs Module A / Module B.
 
-    1. Apply targeted OpenTargets scoring to Secondary rows in "Clinical
-       Efficacy" and "Drug Indication Research" (in place).
-    2. Rebuild "All Combined" from just those two sheets.
-    3. Rebuild "Maturity Weight Scoring" from the new "All Combined".
+    1. Resolve the drug's MOA(s) to Ensembl target ID(s) ONCE, at drug
+       level (MOA is the same for every row of a single-drug workbook).
+    2. Apply targeted OpenTargets scoring to Secondary rows in "Clinical
+       Efficacy" and "Drug Indication Research" (in place), using that
+       one drug-level resolution.
+    3. Rebuild "All Combined" from just those two sheets.
+    4. Rebuild "Maturity Weight Scoring" from the new "All Combined".
     """
     excel_path = Path(excel_path)
     if not excel_path.exists():
@@ -791,8 +918,29 @@ def run_scoring(excel_path: str | Path) -> Path:
     ensembl_cache: dict[str, str | None] = {}
     disease_cache: dict[str, tuple[str, str] | None] = {}
 
-    clinical_rows = _process_sheet(wb, "Clinical Efficacy", ensembl_cache, disease_cache)
-    indication_rows = _process_sheet(wb, "Drug Indication Research", ensembl_cache, disease_cache)
+    # ── Drug-level MOA resolution — happens ONCE, before any row is
+    # processed, not per row. ────────────────────────────────────────────
+    moa_field = _get_drug_moa_field(wb)
+    if moa_field:
+        drug_ensembl_ids = _resolve_drug_ensembl_ids(moa_field, ensembl_cache)
+        if drug_ensembl_ids:
+            logger.info(
+                "Drug-level MOA resolution: '%s' → %d Ensembl target(s): %s",
+                moa_field, len(drug_ensembl_ids), drug_ensembl_ids,
+            )
+        else:
+            logger.warning(
+                "Could not resolve any Ensembl target for MOA(s) '%s' — "
+                "Secondary rows will not get an OpenTargets score", moa_field,
+            )
+    else:
+        drug_ensembl_ids = []
+        logger.warning(
+            "No MOA found on any row — Secondary rows will not get an OpenTargets score"
+        )
+
+    clinical_rows = _process_sheet(wb, "Clinical Efficacy", drug_ensembl_ids, disease_cache)
+    indication_rows = _process_sheet(wb, "Drug Indication Research", drug_ensembl_ids, disease_cache)
 
     molecule = ""
     for row in clinical_rows + indication_rows:
