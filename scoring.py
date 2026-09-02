@@ -16,29 +16,35 @@ and Module B need NOT be re-run), this script:
           name for each MOA.
        b. The OpenTargets search API resolves that name to its real
           Ensembl ID (never trusting an LLM-generated ID directly).
-  3. For every row whose indication_type is "Secondary":
-       a. Resolves the row's indication to its OpenTargets-equivalent
-          disease name — again in two steps: Gemini + Search first
-          (handles abbreviations/synonyms), then the OpenTargets
-          `search` API confirms the canonical name and returns its EFO
-          ID. The indication cell is renamed to this canonical name.
-       b. Queries the OpenTargets target-disease association score
-          (`associatedDiseases(Bs: [efoId])`, filtered to that one
-          disease) for every one of the drug's resolved Ensembl targets
-          (from step 2), and keeps the HIGHEST score across them — this
-          is the drug's best-supported target for that indication.
-     This never bulk-fetches "all associated diseases" for a target —
-     only the specific indications already present in our own data are
-     looked up. Primary rows are left completely untouched: no
-     OpenTargets or Gemini call is made for them, and any pre-existing
-     opentargets_score on a non-Secondary row is cleared.
-  4. Rebuilds "All Combined" from the (now updated) Clinical Efficacy +
+  3. Collects every unique Secondary-indication string across BOTH
+     sheets and resolves ALL of them ONCE, up front — not per row and
+     not per sheet:
+       a. Gemini + Search resolves each indication's OpenTargets-
+          equivalent disease name (handles abbreviations/synonyms),
+          batched (config.SCORING_INDICATION_BATCH_SIZE indications per
+          call) and parallelized (config.MAX_WORKERS_SCORING concurrent
+          batches).
+       b. The OpenTargets `search` API then confirms each resolved
+          name and returns its EFO ID. The indication cell is renamed
+          to this canonical name.
+  4. For every row whose indication_type is "Secondary", queries the
+     OpenTargets target-disease association score
+     (`associatedDiseases(Bs: [efoId])`, filtered to that one disease)
+     for every one of the drug's resolved Ensembl targets (from step 2),
+     and keeps the HIGHEST score across them — this is the drug's
+     best-supported target for that indication. This never bulk-fetches
+     "all associated diseases" for a target — only the specific
+     indications already present in our own data are looked up. Primary
+     rows are left completely untouched: no OpenTargets or Gemini call
+     is made for them, and any pre-existing opentargets_score on a
+     non-Secondary row is cleared.
+  5. Rebuilds "All Combined" from the (now updated) Clinical Efficacy +
      Drug Indication Research rows only — the old bulk "OpenTargets
      Indications" dump is no longer folded in, so this sheet only ever
      contains indications actually observed in trials / innovator
      research, not every disease OpenTargets happens to associate with
      the target.
-  5. Rebuilds the "Maturity Weight Scoring" sheet from that new "All
+  6. Rebuilds the "Maturity Weight Scoring" sheet from that new "All
      Combined" data — keeping Secondary rows ONLY (Primary rows are
      dropped from this sheet) — and appending Maturity_Weight (per row,
      from phase), Effective_Indications (drug-level — the sum of
@@ -68,6 +74,7 @@ import re
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import openpyxl
@@ -342,38 +349,93 @@ def _resolve_ensembl_id_for_moa(moa: str) -> str | None:
     return ensembl_id
 
 
-def _resolve_indication_name_via_gemini(indication: str) -> str | None:
-    """Use Gemini + Search to find the equivalent disease name — as named
-    on the OpenTargets Platform (EFO naming conventions) — for a given
-    indication string. This runs BEFORE the OpenTargets disease search,
-    so e.g. an abbreviation or a trial-specific phrasing gets normalized
-    to something OpenTargets is more likely to recognize."""
+def _resolve_indication_names_via_gemini_batch(indications: list[str]) -> dict[str, str]:
+    """Resolve a BATCH of indications to their OpenTargets-equivalent
+    disease names (EFO naming conventions) in ONE Gemini + Search call.
+    This runs BEFORE the OpenTargets disease search, so e.g. an
+    abbreviation or a trial-specific phrasing gets normalized to
+    something OpenTargets is more likely to recognize.
+
+    Returns a dict keyed by the lowercased original indication →
+    resolved name (missing or empty if it could not be resolved)."""
+    numbered = "\n".join(f"{i + 1}. {ind}" for i, ind in enumerate(indications))
     prompt = f"""
 You are a medical terminology expert.
 
-Indication: "{indication}"
+For EACH of the following indications, identify the equivalent
+disease/phenotype name as used on the OpenTargets Platform
+(https://platform.opentargets.org/), which follows EFO (Experimental
+Factor Ontology) naming conventions.
 
-Identify the equivalent disease/phenotype name as used on the OpenTargets
-Platform (https://platform.opentargets.org/), which follows EFO
-(Experimental Factor Ontology) naming conventions.
+Search the web if needed to confirm the correct name for each one.
 
-Search the web if needed to confirm the correct name.
+Indications:
+{numbered}
 
-Return ONLY valid JSON — no markdown, no explanation:
-{{"disease_name": "<EFO-style disease name>"}}
-If you cannot determine it, return:
-{{"disease_name": ""}}
+Return ONLY valid JSON — a list with exactly one entry per indication
+above, in the SAME ORDER, no markdown, no explanation:
+[
+  {{"indication": "<original indication text, exactly as given>", "disease_name": "<EFO-style disease name>"}},
+  ...
+]
+If you cannot determine a name for an indication, use an empty string for its disease_name.
 """
+    result: dict[str, str] = {}
     try:
         text = _gemini_generate(prompt, system_instruction="Return ONLY valid JSON.", use_search=True)
         if not text:
-            return None
+            return result
         data = _extract_json(text)
-        disease_name = (data.get("disease_name") or "").strip()
-        return disease_name or None
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                orig = (item.get("indication") or "").strip()
+                name = (item.get("disease_name") or "").strip()
+                if orig:
+                    result[orig.lower()] = name
     except Exception as e:
-        logger.warning("Failed to resolve OpenTargets disease name for indication '%s': %s", indication, e)
-        return None
+        logger.warning("Failed to batch-resolve OpenTargets names for %d indication(s): %s", len(indications), e)
+    return result
+
+
+def _resolve_indication_names_via_gemini(indications: list[str]) -> dict[str, str]:
+    """Resolve every unique indication's OpenTargets-equivalent name via
+    Gemini + Search, ONCE, up front — not per row. Indications are
+    batched (config.SCORING_INDICATION_BATCH_SIZE per Gemini call) and
+    batches run concurrently (config.MAX_WORKERS_SCORING workers),
+    mirroring the same batch+parallel pattern used for trial extraction
+    and indication classification elsewhere in the pipeline.
+
+    Returns a dict keyed by the lowercased original indication → resolved
+    name (empty string if Gemini couldn't determine one)."""
+    unique = sorted({i.strip() for i in indications if i and i.strip()})
+    if not unique:
+        return {}
+
+    batch_size = max(1, config.SCORING_INDICATION_BATCH_SIZE)
+    batches = [unique[i:i + batch_size] for i in range(0, len(unique), batch_size)]
+
+    logger.info(
+        "Resolving %d unique Secondary indication(s) in %d batch(es) of up to %d "
+        "(parallelism: %d workers)",
+        len(unique), len(batches), batch_size, config.MAX_WORKERS_SCORING,
+    )
+
+    merged: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=config.MAX_WORKERS_SCORING) as executor:
+        futures = {
+            executor.submit(_resolve_indication_names_via_gemini_batch, batch): batch
+            for batch in batches
+        }
+        for future in as_completed(futures):
+            try:
+                merged.update(future.result())
+            except Exception as e:
+                logger.error("Batch indication-name resolution failed: %s", e)
+
+    return merged
+
 
 
 def _search_opentargets_disease(indication: str) -> tuple[str, str] | None:
@@ -508,12 +570,15 @@ def _update_secondary_rows_with_opentargets(
     ensembl_ids: list[str],
     disease_cache: dict[str, tuple[str, str] | None],
 ) -> None:
-    """Mutate *ws* in place: for Secondary rows, resolve the indication's
-    OpenTargets-equivalent name (Gemini + Search, then confirmed via the
-    OpenTargets search API), align the indication name, and stamp
-    opentargets_score with the highest association score across the
-    drug's *ensembl_ids* (resolved once, at drug level, by the caller —
-    see _resolve_drug_ensembl_ids). For every other row, clear any stale
+    """Mutate *ws* in place: for Secondary rows, align the indication name
+    and stamp opentargets_score with the highest association score across
+    the drug's *ensembl_ids* (resolved once, at drug level, by the caller
+    — see _resolve_drug_ensembl_ids). *disease_cache* must already be
+    fully populated by the caller (see _resolve_indication_names_via_gemini
+    + the OpenTargets search pass in run_scoring) — this function only
+    looks up cache entries, it never calls Gemini or OpenTargets search
+    itself, so per-row work here is just cheap dict lookups + the
+    association-score API call. For every other row, clear any stale
     opentargets_score. Cell writes are targeted (only the indication and
     opentargets_score columns) so all other formatting is untouched."""
     ind_col = header_to_col.get("indication")
@@ -546,14 +611,8 @@ def _update_secondary_rows_with_opentargets(
             )
             continue
 
-        # Resolve the indication's OpenTargets-equivalent name via
-        # Gemini + Search first, then confirm/locate it (and its EFO ID)
-        # through the OpenTargets search API.
         cache_key = indication.lower()
-        if cache_key not in disease_cache:
-            gemini_name = _resolve_indication_name_via_gemini(indication)
-            disease_cache[cache_key] = _search_opentargets_disease(gemini_name or indication)
-        hit = disease_cache[cache_key]
+        hit = disease_cache.get(cache_key)
         if not hit:
             continue
         efo_id, ot_name = hit
@@ -579,11 +638,33 @@ def _update_secondary_rows_with_opentargets(
         row["opentargets_score"] = score
 
 
+def _collect_secondary_indications(wb, sheet_names: list[str]) -> list[str]:
+    """Scan the given sheets and return every unique Secondary-row
+    indication string across all of them, so they can all be resolved in
+    one batched, parallel pass before any row is touched — mirroring the
+    drug-level MOA resolution."""
+    indications: list[str] = []
+    for sheet_name in sheet_names:
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        _headers, rows, _header_to_col = _read_sheet_rows(ws)
+        for row in rows:
+            itype = str(row.get("indication_type", "") or "").strip().lower()
+            if itype != "secondary":
+                continue
+            indication = str(row.get("indication", "") or "").strip()
+            if indication and indication.lower() != "no indication found":
+                indications.append(indication)
+    return indications
+
+
 def _process_sheet(wb, sheet_name: str, ensembl_ids: list[str], disease_cache: dict) -> list[dict]:
     """Read *sheet_name*, apply targeted OpenTargets scoring to its
-    Secondary rows in place (using the drug-level *ensembl_ids* resolved
-    once by the caller), and return the resulting row dicts (ready for
-    use elsewhere, e.g. rebuilding "All Combined")."""
+    Secondary rows in place (using the drug-level *ensembl_ids* and the
+    already-populated *disease_cache*, both resolved once by the caller),
+    and return the resulting row dicts (ready for use elsewhere, e.g.
+    rebuilding "All Combined")."""
     if sheet_name not in wb.sheetnames:
         logger.warning("Sheet '%s' not found in workbook — skipping", sheet_name)
         return []
@@ -903,11 +984,13 @@ def run_scoring(excel_path: str | Path) -> Path:
 
     1. Resolve the drug's MOA(s) to Ensembl target ID(s) ONCE, at drug
        level (MOA is the same for every row of a single-drug workbook).
-    2. Apply targeted OpenTargets scoring to Secondary rows in "Clinical
-       Efficacy" and "Drug Indication Research" (in place), using that
-       one drug-level resolution.
-    3. Rebuild "All Combined" from just those two sheets.
-    4. Rebuild "Maturity Weight Scoring" from the new "All Combined".
+    2. Resolve every unique Secondary indication's OpenTargets name ONCE,
+       across both sheets, batched + parallelized.
+    3. Apply targeted OpenTargets scoring to Secondary rows in "Clinical
+       Efficacy" and "Drug Indication Research" (in place), using those
+       precomputed resolutions.
+    4. Rebuild "All Combined" from just those two sheets.
+    5. Rebuild "Maturity Weight Scoring" from the new "All Combined".
     """
     excel_path = Path(excel_path)
     if not excel_path.exists():
@@ -938,6 +1021,24 @@ def run_scoring(excel_path: str | Path) -> Path:
         logger.warning(
             "No MOA found on any row — Secondary rows will not get an OpenTargets score"
         )
+
+    # ── Indication-name resolution — also happens ONCE, up front, across
+    # BOTH sheets, not per row: collect every unique Secondary indication,
+    # batch-resolve their OpenTargets-equivalent names via Gemini (batched
+    # + parallelized per config.SCORING_INDICATION_BATCH_SIZE /
+    # config.MAX_WORKERS_SCORING), then confirm/locate each one (and its
+    # EFO ID) through the OpenTargets search API. The per-row pass below
+    # is then just a cache lookup. ───────────────────────────────────────
+    secondary_indications = _collect_secondary_indications(
+        wb, ["Clinical Efficacy", "Drug Indication Research"]
+    )
+    gemini_name_map = _resolve_indication_names_via_gemini(secondary_indications)
+    for indication in dict.fromkeys(secondary_indications):  # dedupe, keep order
+        cache_key = indication.lower()
+        if cache_key in disease_cache:
+            continue
+        gemini_name = gemini_name_map.get(cache_key)
+        disease_cache[cache_key] = _search_opentargets_disease(gemini_name or indication)
 
     clinical_rows = _process_sheet(wb, "Clinical Efficacy", drug_ensembl_ids, disease_cache)
     indication_rows = _process_sheet(wb, "Drug Indication Research", drug_ensembl_ids, disease_cache)
