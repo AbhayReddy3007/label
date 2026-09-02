@@ -545,9 +545,10 @@ def _fetch_clinical_trials(molecule_name: str) -> list[dict]:
     """
     table_id = f"{config.PROJECT_ID}.{config.BQ_DATASET_ID}.{config.CLINICAL_TRIALS_TABLE}"
     query = f"""
-        SELECT molecule_name, company_name, source_url, phase, trial_id, trial_size
+        SELECT molecule_name, company_name, source_url, phase, trial_id, trial_size, llm_confidence
         FROM `{table_id}`
         WHERE LOWER(molecule_name) = LOWER(@molecule)
+          AND llm_confidence > 0.6
     """
     job_config = bigquery.QueryJobConfig(
         query_parameters=[bigquery.ScalarQueryParameter("molecule", "STRING", molecule_name)]
