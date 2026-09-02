@@ -101,6 +101,7 @@ GEMINI_RETRY_BASE_DELAY_SECONDS: int = _env_int("GEMINI_RETRY_BASE_DELAY_SECONDS
 # ══════════════════════════════════════════════════════════════════════════
 MAX_WORKERS_TRIALS: int = _env_int("MAX_WORKERS_TRIALS", 10)      # parallel batch workers
 MAX_WORKERS_INNOVATOR: int = _env_int("MAX_WORKERS_INNOVATOR", 5)  # innovator-source research
+MAX_WORKERS_SCORING: int = _env_int("MAX_WORKERS_SCORING", 5)      # scoring.py indication-name resolution
 
 # Number of trials to send to Gemini in a single call for indication extraction.
 # Higher = fewer LLM calls but larger prompts; lower = more calls but easier for
@@ -110,6 +111,12 @@ TRIAL_BATCH_SIZE: int = _env_int("TRIAL_BATCH_SIZE", 5)
 # Number of unique indications per Gemini call for standardisation and
 # classification. Each batch is one LLM call. Recommended range: 5-15.
 INDICATION_BATCH_SIZE: int = _env_int("INDICATION_BATCH_SIZE", 10)
+
+# Number of unique Secondary indications per Gemini call in scoring.py, when
+# resolving each indication's OpenTargets-equivalent name. Each batch is one
+# LLM call; batches run in parallel across MAX_WORKERS_SCORING workers.
+# Recommended range: 5-15.
+SCORING_INDICATION_BATCH_SIZE: int = _env_int("SCORING_INDICATION_BATCH_SIZE", 10)
 
 # ══════════════════════════════════════════════════════════════════════════
 #  OUTPUT — label_expansion pipeline
